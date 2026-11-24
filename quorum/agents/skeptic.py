@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from typing import Callable, Optional
 
-from ..backtest import expectancy, simulate
+from ..backtest import NO_COSTS, CostModel, expectancy, simulate
 from ..types import Proposal, Verdict, Vote
 
 
@@ -11,7 +11,8 @@ class Skeptic:
     """Argues against every idea. Asks "what if this edge is just luck?"
 
     The Validator checks the numbers. The Skeptic checks whether the numbers
-    deserve to be trusted: is the edge stable, and could chance explain it?
+    deserve to be trusted: is the edge stable, does it hang on one lucky
+    trade, and could chance explain it?
     """
 
     name = "skeptic"
@@ -26,9 +27,10 @@ class Skeptic:
         self.seed = seed
 
     def review(self, proposal: Proposal, candles: list,
-               signal_fn: Callable[[list], Optional[Proposal]]) -> Verdict:
+               signal_fn: Callable[[list], Optional[Proposal]],
+               costs: CostModel = NO_COSTS, neighbors=()) -> Verdict:
         start = max(self.warmup, int(len(candles) * (1 - self.holdout)))
-        return self.assess(simulate(candles, signal_fn, start))
+        return self.assess(simulate(candles, signal_fn, start, None, costs))
 
     def assess(self, results: list) -> Verdict:
         n = len(results)
@@ -41,6 +43,11 @@ class Skeptic:
         if (first > 0) != (second > 0):
             challenges.append(f"edge flips between halves ({first:.2f}R then {second:.2f}R)")
 
+        rest = list(results)
+        rest.remove(max(results))
+        if expectancy(results) > 0 and expectancy(rest) <= 0:
+            challenges.append("edge depends on a single trade")
+
         rng = random.Random(self.seed)
         no_edge = sum(1 for _ in range(self.resamples)
                       if sum(rng.choice(results) for _ in range(n)) <= 0)
@@ -49,11 +56,16 @@ class Skeptic:
             challenges.append(f"{luck:.0%} of resamples show no edge, could be luck")
 
         streak = worst = 0
+        equity = peak = drawdown = 0.0
         for r in results:
             streak = streak + 1 if r <= 0 else 0
             worst = max(worst, streak)
+            equity += r
+            peak = max(peak, equity)
+            drawdown = max(drawdown, peak - equity)
 
         if challenges:
             return Verdict(self.name, Vote.REJECT, "; ".join(challenges))
         return Verdict(self.name, Vote.APPROVE,
-                       f"could not break it: luck chance {luck:.0%}, worst losing streak {worst}")
+                       f"could not break it: luck chance {luck:.0%}, worst losing streak {worst}, "
+                       f"max drawdown {drawdown:.1f}R")

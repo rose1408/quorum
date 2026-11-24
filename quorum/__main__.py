@@ -4,6 +4,7 @@ import random
 
 from .agents import (AccountState, MarketObserver, PaperMonitor, ResearchAnalyst, RiskManager,
                      Skeptic, StrategyAnalyst, TradeJournal, Validator)
+from .backtest import CostModel
 from .coordinator import Coordinator
 from .types import Candle
 
@@ -22,10 +23,14 @@ def synthetic_candles(n: int = 600, seed: int = 7, drift: float = 0.0004) -> lis
     return out
 
 
+DEMO_COSTS = CostModel(spread=0.03, slippage=0.01)
+
+
 def build_coordinator() -> Coordinator:
     return Coordinator(
         MarketObserver(), StrategyAnalyst(), Validator(), RiskManager(),
-        skeptic=Skeptic(), monitor=PaperMonitor(), journal=TradeJournal(), researcher=ResearchAnalyst(),
+        skeptic=Skeptic(), monitor=PaperMonitor(), journal=TradeJournal(),
+        researcher=ResearchAnalyst(), costs=DEMO_COSTS,
     )
 
 
@@ -50,6 +55,8 @@ def main() -> None:
         print("proposal:", decision.proposal)
     for v in decision.verdicts:
         print(f"  {v.agent}: {v.vote.value} - {v.reason}")
+    for w in decision.warnings:
+        print("  data warning:", w)
     if decision.approved:
         print("size:    ", round(decision.size, 4))
 

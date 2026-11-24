@@ -14,12 +14,30 @@ class StrategyAnalyst:
 
     name = "strategy_analyst"
 
-    def __init__(self, stop_atr: float = 2.0, reward_risk: float = 2.0):
+    def __init__(self, stop_atr: float = 2.0, reward_risk: float = 2.0, skip_high_vol: bool = False):
         self.stop_atr = stop_atr
         self.reward_risk = reward_risk
+        self.skip_high_vol = skip_high_vol
+
+    @property
+    def params(self) -> dict:
+        return {"stop_atr": self.stop_atr, "reward_risk": self.reward_risk,
+                "skip_high_vol": self.skip_high_vol}
+
+    def variants(self, scale: float = 0.2) -> list:
+        """Nearby settings (each number nudged up and down) for the Validator's robustness check."""
+        out = []
+        for key in ("stop_atr", "reward_risk"):
+            for factor in (1 - scale, 1 + scale):
+                kwargs = self.params
+                kwargs[key] = round(kwargs[key] * factor, 6)
+                out.append(type(self)(**kwargs))
+        return out
 
     def propose(self, snapshot: MarketSnapshot) -> Optional[Proposal]:
         if not snapshot.data_ok or snapshot.atr <= 0:
+            return None
+        if self.skip_high_vol and snapshot.vol_state == "high":
             return None
         entry = snapshot.last_close
         dist = snapshot.atr * self.stop_atr

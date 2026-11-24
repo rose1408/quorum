@@ -1,3 +1,4 @@
+from .data_quality import DataQualityAgent, DataReport
 from .market_observer import MarketObserver
 from .strategy_analyst import StrategyAnalyst
 from .validator import Validator
@@ -8,6 +9,8 @@ from .paper_monitor import PaperMonitor, PaperTrade, MonitorReport
 from .trade_journal import TradeJournal, JournalEntry
 
 __all__ = [
+    "DataQualityAgent",
+    "DataReport",
     "MarketObserver",
     "StrategyAnalyst",
     "Validator",

@@ -40,6 +40,7 @@ class MarketSnapshot:
     atr: float  # average true range
     data_ok: bool
     notes: tuple = ()
+    vol_state: str = "normal"  # low, normal, or high vs the longer-run average
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class Verdict:
     vote: Vote
     reason: str
     size: Optional[float] = None
+    metrics: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -67,3 +69,4 @@ class Decision:
     verdicts: tuple
     size: float
     reason: str
+    warnings: tuple = ()

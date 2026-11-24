@@ -17,8 +17,7 @@ class PaperTrade:
     size: float
 
     def risk(self) -> float:
-        d = self.planned_entry - self.stop if self.side == Side.LONG else self.stop - self.planned_entry
-        return d
+        return self.planned_entry - self.stop if self.side == Side.LONG else self.stop - self.planned_entry
 
     def r_result(self) -> float:
         move = self.exit_price - self.fill_entry if self.side == Side.LONG else self.fill_entry - self.exit_price
@@ -41,17 +40,25 @@ class MonitorReport:
 
 
 class PaperMonitor:
-    """Compares paper fills to what the backtest assumed and flags drift."""
+    """Compares recent paper fills to what the backtest assumed and flags drift.
+
+    Only the last `window` trades count, so it notices when an edge stops
+    working instead of being diluted by old results.
+    """
 
     name = "paper_monitor"
 
     def __init__(self, expected_r: Optional[float] = None, tolerance_r: float = 0.3,
-                 min_trades: int = 10, max_slippage_r: float = 0.2):
+                 min_trades: int = 10, max_slippage_r: float = 0.2, window: int = 30):
         self.expected_r = expected_r
         self.tolerance_r = tolerance_r
         self.min_trades = min_trades
         self.max_slippage_r = max_slippage_r
+        self.window = window
         self.trades: list = []
+
+    def set_expected(self, expected_r: float) -> None:
+        self.expected_r = expected_r
 
     def record(self, trade: PaperTrade) -> None:
         if trade.risk() <= 0:
@@ -59,11 +66,12 @@ class PaperMonitor:
         self.trades.append(trade)
 
     def report(self) -> MonitorReport:
-        n = len(self.trades)
+        recent = self.trades[-self.window:]
+        n = len(recent)
         if n == 0:
             return MonitorReport(0, 0.0, 0.0, False, False, ("no paper trades yet",))
-        avg_r = sum(t.r_result() for t in self.trades) / n
-        avg_slip = sum(t.slippage_r() for t in self.trades) / n
+        avg_r = sum(t.r_result() for t in recent) / n
+        avg_slip = sum(t.slippage_r() for t in recent) / n
         notes, drift, halt = [], False, False
         if avg_slip > self.max_slippage_r:
             notes.append(f"average slippage {avg_slip:.2f}R is above the {self.max_slippage_r:.2f}R assumed")
