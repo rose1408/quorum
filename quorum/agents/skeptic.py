@@ -18,7 +18,7 @@ class Skeptic:
     name = "skeptic"
 
     def __init__(self, holdout: float = 0.4, warmup: int = 40, min_trades: int = 20,
-                 resamples: int = 1000, max_luck: float = 0.2, seed: int = 11):
+                 resamples: int = 1000, max_luck: float = 0.05, seed: int = 11):
         self.holdout = holdout
         self.warmup = warmup
         self.min_trades = min_trades
@@ -26,7 +26,7 @@ class Skeptic:
         self.max_luck = max_luck
         self.seed = seed
 
-    def review(self, proposal: Proposal, candles: list,
+    def review(self, proposal: Optional[Proposal], candles: list,
                signal_fn: Callable[[list], Optional[Proposal]],
                costs: CostModel = NO_COSTS, neighbors=()) -> Verdict:
         start = max(self.warmup, int(len(candles) * (1 - self.holdout)))

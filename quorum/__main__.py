@@ -1,65 +1,50 @@
 from __future__ import annotations
 
-import random
+import argparse
+import sys
 
-from .agents import (AccountState, MarketObserver, PaperMonitor, ResearchAnalyst, RiskManager,
-                     Skeptic, StrategyAnalyst, TradeJournal, Validator)
+from .agents import AccountState, PortfolioLimits, RiskLimits
 from .backtest import CostModel
-from .coordinator import Coordinator
-from .types import Candle
+from .config import DEMO_COSTS, QuorumConfig
+from .data import load_markets, synthetic_markets
+from .report import render_report
+from .scan import scan_markets
 
 
-def synthetic_candles(n: int = 600, seed: int = 7, drift: float = 0.0004) -> list:
-    """Fake data so the demo runs. Replace with real Step Index candles."""
-    rng = random.Random(seed)
-    price, out = 100.0, []
-    for i in range(n):
-        o = price
-        c = o * (1 + rng.gauss(drift, 0.003))
-        h = max(o, c) * (1 + abs(rng.gauss(0, 0.001)))
-        l = min(o, c) * (1 - abs(rng.gauss(0, 0.001)))
-        out.append(Candle(60 * i, o, h, l, c))
-        price = c
-    return out
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="quorum", description="Quorum: advisory multi-market research. No orders are placed.")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("demo", help="scan three synthetic markets with known behavior")
+    scan = sub.add_parser("scan", help="scan your own candle files (CSV with time, open, high, low, close)")
+    scan.add_argument("files", nargs="+", help="one CSV per market; the file name becomes the market name")
+    for p in (scan, sub.choices["demo"]):
+        p.add_argument("--equity", type=float, default=1000.0)
+        p.add_argument("--workers", type=int, default=3, help="markets analyzed at the same time")
+        p.add_argument("--out", help="write the report to this file as Markdown")
+    scan.add_argument("--spread", type=float, default=0.0, help="spread in price units, per round trip")
+    scan.add_argument("--slippage", type=float, default=0.0, help="slippage in price units, per side")
+    scan.add_argument("--fee", type=float, default=0.0, help="fee in price units, per round trip")
+    scan.add_argument("--risk", type=float, default=0.01, help="share of equity risked per trade")
+    args = parser.parse_args(argv)
 
+    if args.cmd == "scan":
+        markets = load_markets(args.files)
+        config = QuorumConfig(costs=CostModel(args.spread, args.slippage, args.fee),
+                              risk=RiskLimits(risk_per_trade=args.risk))
+    else:
+        markets = synthetic_markets(n=3000)
+        config = QuorumConfig(costs=DEMO_COSTS)
 
-DEMO_COSTS = CostModel(spread=0.03, slippage=0.01)
-
-
-def build_coordinator() -> Coordinator:
-    return Coordinator(
-        MarketObserver(), StrategyAnalyst(), Validator(), RiskManager(),
-        skeptic=Skeptic(), monitor=PaperMonitor(), journal=TradeJournal(),
-        researcher=ResearchAnalyst(), costs=DEMO_COSTS,
-    )
-
-
-def main() -> None:
-    coordinator = build_coordinator()
-    candles = synthetic_candles()
-
-    print("== research ==")
-    report = coordinator.research("DEMO", candles)
-    for r in report.results[:3]:
-        print(f"  {r.params}: train {r.train_expectancy:.2f}R ({r.train_trades}), "
-              f"valid {r.valid_expectancy:.2f}R ({r.valid_trades}){'  OVERFIT' if r.overfit else ''}")
-    print("  best:", report.best.params if report.best else "none")
-    for note in report.notes:
-        print("  note:", note)
-
-    print("== decision ==")
-    decision = coordinator.decide("DEMO", candles, AccountState(equity=1000.0))
-    print("approved:", decision.approved)
-    print("reason:  ", decision.reason)
-    if decision.proposal:
-        print("proposal:", decision.proposal)
-    for v in decision.verdicts:
-        print(f"  {v.agent}: {v.vote.value} - {v.reason}")
-    for w in decision.warnings:
-        print("  data warning:", w)
-    if decision.approved:
-        print("size:    ", round(decision.size, 4))
+    result = scan_markets(markets, AccountState(equity=args.equity), config, workers=args.workers)
+    text = render_report(result, args.equity)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"report written to {args.out}")
+    else:
+        print(text)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

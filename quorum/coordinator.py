@@ -60,7 +60,7 @@ class Coordinator:
 
         proposal = self.analyst.propose(snapshot)
         if proposal is None:
-            return self._done(Decision(None, False, (), 0.0, f"no setup in {snapshot.regime.value} market", warnings))
+            return self._done(Decision(None, False, (), 0.0, f"no setup right now ({snapshot.regime.value} market)", warnings))
 
         signal_fn = self._signal_fn(symbol, self.analyst)
         variants = self.analyst.variants() if hasattr(self.analyst, "variants") else []
@@ -89,6 +89,19 @@ class Coordinator:
             if self.monitor is not None and self.monitor.expected_r is None and metrics:
                 self.monitor.set_expected(metrics["expectancy_r"])  # baseline for drift checks
         return self._done(decision)
+
+    def exam(self, symbol: str, candles: list) -> tuple:
+        """Test the current strategy on the holdout whether or not a setup exists right now.
+
+        Answers "is this strategy worth watching?" while `decide` answers "is there a trade now?".
+        """
+        signal_fn = self._signal_fn(symbol, self.analyst)
+        variants = self.analyst.variants() if hasattr(self.analyst, "variants") else []
+        neighbors = [self._signal_fn(symbol, a) for a in variants]
+        verdicts = [self.validator.review(None, candles, signal_fn, costs=self.costs, neighbors=neighbors)]
+        if self.skeptic is not None:
+            verdicts.append(self.skeptic.review(None, candles, signal_fn, costs=self.costs))
+        return tuple(verdicts)
 
     def research(self, symbol: str, candles: list) -> ExperimentReport:
         if self.researcher is None:

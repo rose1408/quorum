@@ -7,16 +7,19 @@ When an LLM layer is added, these are the checks it must keep passing.
 """
 from __future__ import annotations
 
+import random
 import re
 import sys
 from dataclasses import dataclass
 
-from .__main__ import DEMO_COSTS, build_coordinator, synthetic_candles
-from .agents import (AccountState, MarketObserver, PaperMonitor, PaperTrade, RiskLimits, RiskManager,
-                     StrategyAnalyst, Validator)
+from .config import DEMO_COSTS, QuorumConfig, build_coordinator
+from .data import synthetic_candles, synthetic_markets
+from .scan import SymbolAnalysis, scan_markets
+from .agents import (AccountState, MarketFlow, MarketObserver, PaperMonitor, PaperTrade, PortfolioLimits,
+                     PortfolioRiskManager, RiskLimits, RiskManager, StrategyAnalyst, Validator)
 from .backtest import NO_COSTS, simulate
 from .coordinator import Coordinator
-from .types import Candle, Side, Vote
+from .types import Candle, Decision, Proposal, Side, Verdict, Vote
 
 
 @dataclass(frozen=True)
@@ -119,8 +122,51 @@ def eval_monitor_halts() -> EvalResult:
     return EvalResult("a drifting edge halts trading", not d.approved and "halted" in d.reason, d.reason)
 
 
+def fake_analysis(symbol: str, side: Side, size: float, expectancy: float,
+                  entry: float = 100.0, stop_gap: float = 1.0) -> SymbolAnalysis:
+    """An approved idea with made-up numbers, for testing the portfolio layer."""
+    stop = entry - stop_gap if side == Side.LONG else entry + stop_gap
+    target = entry + 2 * stop_gap if side == Side.LONG else entry - 2 * stop_gap
+    d = Decision(Proposal(symbol, side, entry, stop, target, "test"), True,
+                 (Verdict("validator", Vote.APPROVE, "ok", None, {"expectancy_r": expectancy}),
+                  Verdict("risk_manager", Vote.APPROVE, "ok", size)), size, "quorum reached")
+    return SymbolAnalysis(symbol, None, None, None, None, d, ())
+
+
+def eval_portfolio_caps() -> EvalResult:
+    rng, bad = random.Random(5), []
+    for trial in range(200):
+        n = rng.randint(2, 5)
+        names = [f"M{i}" for i in range(n)]
+        analyses = [fake_analysis(s, rng.choice([Side.LONG, Side.SHORT]), rng.uniform(1, 25), rng.uniform(0, 1))
+                    for s in names]
+        corr = {(a, b): rng.uniform(-1, 1) for i, a in enumerate(names) for b in names[i + 1:]}
+        limits = PortfolioLimits(max_total_risk=rng.choice([0.01, 0.02, 0.03]), max_positions=rng.randint(1, 3))
+        account = AccountState(equity=1000.0, open_positions=rng.randint(0, 1))
+        plan = PortfolioRiskManager(limits).allocate(analyses, MarketFlow({}, corr, (), ()), account)
+        chosen = {al.symbol: al for al in plan.allocations}
+        links = MarketFlow({}, corr, (), ())
+        pairs_ok = all(
+            (1 if chosen[a].side == chosen[b].side else -1) * links.corr(a, b) < limits.max_correlation
+            for a in chosen for b in chosen if a < b)
+        if (plan.total_risk > limits.max_total_risk + 1e-9
+                or len(chosen) > limits.max_positions - account.open_positions or not pairs_ok):
+            bad.append(trial)
+    return EvalResult("portfolio never breaks its risk, position, or correlation limits", not bad,
+                      "held for 200 random scenarios" if not bad else f"broken in trials {bad[:5]}")
+
+
+def eval_parallel_matches_sequential() -> EvalResult:
+    markets = synthetic_markets(n=800)
+    one = scan_markets(markets, AccountState(equity=1000.0), QuorumConfig(), workers=1)
+    many = scan_markets(markets, AccountState(equity=1000.0), QuorumConfig(), workers=3)
+    return EvalResult("analyzing markets in parallel gives the same answer as one at a time", one == many,
+                      "identical" if one == many else "results differ")
+
+
 ALL_EVALS = [eval_deterministic, eval_bad_data_blocks, eval_kill_switch_blocks, eval_veto_dominance,
-             eval_size_within_risk, eval_costs_reduce_results, eval_reported_numbers_match, eval_monitor_halts]
+             eval_size_within_risk, eval_costs_reduce_results, eval_reported_numbers_match, eval_monitor_halts,
+             eval_portfolio_caps, eval_parallel_matches_sequential]
 
 
 def run_evals() -> list:

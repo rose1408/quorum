@@ -41,6 +41,11 @@ class MarketSnapshot:
     data_ok: bool
     notes: tuple = ()
     vol_state: str = "normal"  # low, normal, or high vs the longer-run average
+    fast_ma: float = 0.0
+    slow_ma: float = 0.0
+    channel_high: float = 0.0  # highest high of the previous channel_period candles
+    channel_low: float = 0.0
+    stretch: float = 0.0       # (close - slow MA) / ATR
 
 
 @dataclass(frozen=True)

@@ -1,13 +1,22 @@
 import unittest
 
-from quorum.__main__ import synthetic_candles
-from quorum.agents import (AccountState, DataQualityAgent, MarketObserver, PaperMonitor, PaperTrade,
-                           ResearchAnalyst, RiskLimits, RiskManager, Skeptic, StrategyAnalyst, TradeJournal,
-                           Validator)
+import os
+import tempfile
+
+from quorum.data import load_candles, load_markets, synthetic_candles, synthetic_market, synthetic_markets
+from quorum.agents import (AccountState, Breakout, DataQualityAgent, FlowAnalyst, MarketFlow, MarketObserver,
+                           MeanReversion, PaperMonitor, PaperTrade, PortfolioLimits, PortfolioRiskManager,
+                           ResearchAnalyst, RiskLimits, RiskManager, Skeptic, StrategyAnalyst, StrategyLab,
+                           TradeJournal, TrendFollow, Validator)
+from quorum.config import QuorumConfig, build_coordinator
+from quorum.evals import fake_analysis
+from quorum.report import render_report
+from quorum.scan import scan_markets
+from quorum.__main__ import main as cli_main
 from quorum.backtest import NO_COSTS, CostModel, cost_r, simulate, walk
 from quorum.coordinator import Coordinator
 from quorum.evals import run_evals
-from quorum.types import Candle, Decision, Proposal, Regime, Side, Vote
+from quorum.types import Candle, Decision, MarketSnapshot, Proposal, Regime, Side, Vote
 
 EASY = dict(min_trades=0, min_expectancy_r=-99, min_positive_windows=0.0, min_robust=0.0)
 
@@ -376,6 +385,214 @@ class CoordinatorTests(unittest.TestCase):
         d = coord.decide("X", synthetic_candles(), AccountState(equity=1000.0))
         self.assertFalse(d.approved)
         self.assertIn("costs", d.reason)
+
+
+def snap(**kw):
+    base = dict(symbol="X", last_close=100.0, regime=Regime.RANGING, volatility=0.003, atr=1.0, data_ok=True,
+                notes=(), vol_state="normal", fast_ma=100.0, slow_ma=100.0, channel_high=101.0,
+                channel_low=99.0, stretch=0.0)
+    base.update(kw)
+    return MarketSnapshot(**base)
+
+
+class StrategyFamilyTests(unittest.TestCase):
+    def test_mean_reversion_fades_a_stretch_back_to_the_average(self):
+        p = MeanReversion(entry_stretch=2.0, stop_atr=1.5).propose(snap(last_close=97.0, slow_ma=100.0, stretch=-3.0))
+        self.assertEqual(p.side, Side.LONG)
+        self.assertEqual(p.target, 100.0)
+        s = MeanReversion(entry_stretch=2.0).propose(snap(last_close=103.0, slow_ma=100.0, stretch=3.0))
+        self.assertEqual(s.side, Side.SHORT)
+        self.assertIsNone(MeanReversion(entry_stretch=2.0).propose(snap(stretch=1.0)))
+
+    def test_breakout_needs_a_close_beyond_the_channel(self):
+        self.assertEqual(Breakout().propose(snap(last_close=102.0)).side, Side.LONG)
+        self.assertEqual(Breakout().propose(snap(last_close=98.0)).side, Side.SHORT)
+        self.assertIsNone(Breakout().propose(snap(last_close=100.0)))
+
+    def test_every_family_nudges_its_own_settings(self):
+        self.assertEqual(len(MeanReversion().variants()), 4)
+        self.assertEqual(len(Breakout().variants()), 4)
+        self.assertTrue(all(isinstance(v, TrendFollow) for v in TrendFollow().variants()))
+
+    def test_old_name_still_works(self):
+        self.assertIs(StrategyAnalyst, TrendFollow)
+
+
+class DataLoadingTests(unittest.TestCase):
+    def write(self, text):
+        path = os.path.join(tempfile.mkdtemp(), "EURUSD.csv")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def test_comma_csv_with_iso_times(self):
+        path = self.write("time,open,high,low,close\n2024-01-02 10:00:00,1.0,1.2,0.9,1.1\n2024-01-02 10:01:00,1.1,1.3,1.0,1.2\n")
+        c = load_candles(path)
+        self.assertEqual(len(c), 2)
+        self.assertEqual(c[1].ts - c[0].ts, 60)
+        self.assertEqual(c[1].close, 1.2)
+
+    def test_mt5_style_tab_export_with_split_date_and_time(self):
+        path = self.write("<DATE>\t<TIME>\t<OPEN>\t<HIGH>\t<LOW>\t<CLOSE>\n2024.01.02\t10:00\t1.0\t1.2\t0.9\t1.1\n2024.01.02\t10:05\t1.1\t1.3\t1.0\t1.2\n")
+        c = load_candles(path)
+        self.assertEqual(c[1].ts - c[0].ts, 300)
+
+    def test_epoch_milliseconds(self):
+        path = self.write("timestamp,open,high,low,close\n1704189600000,1,2,0.5,1.5\n1704189660000,1.5,2,1,1.2\n")
+        c = load_candles(path)
+        self.assertEqual(c[1].ts - c[0].ts, 60)
+
+    def test_missing_column_is_explained(self):
+        with self.assertRaises(ValueError) as ctx:
+            load_candles(self.write("time,open,high,low\n1,1,1,1\n"))
+        self.assertIn("close", str(ctx.exception))
+
+    def test_market_name_comes_from_the_file_name(self):
+        path = self.write("time,open,high,low,close\n1,1,1,1,1\n")
+        self.assertEqual(list(load_markets([path])), ["EURUSD"])
+
+
+class FlowTests(unittest.TestCase):
+    def label(self, kind, seed):
+        return FlowAnalyst().analyze("X", synthetic_market(kind, 3000, seed), MarketObserver())
+
+    def test_trending_market_is_labeled_trending(self):
+        self.assertEqual(self.label("trending", 1).structure, "trending")
+
+    def test_mean_reverting_market_is_labeled_mean_reverting(self):
+        self.assertEqual(self.label("mean_reverting", 2).structure, "mean-reverting")
+
+    def test_random_market_is_labeled_random_and_warned(self):
+        r = self.label("random", 3)
+        self.assertEqual(r.structure, "random")
+        self.assertTrue(r.notes)
+
+    def test_short_history_is_unknown(self):
+        self.assertEqual(FlowAnalyst().analyze("X", synthetic_candles(40), MarketObserver()).structure, "unknown")
+
+    def test_ranks_by_flow_and_measures_correlation(self):
+        markets = synthetic_markets(n=600, rho=0.5)
+        fa = FlowAnalyst()
+        reports = {s: fa.analyze(s, c, MarketObserver()) for s, c in markets.items()}
+        flow = fa.compare(reports, markets)
+        scores = [reports[s].flow_score for s in flow.ranking]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertEqual(len(flow.correlation), 3)
+        self.assertTrue(all(0.2 < v < 0.8 for v in flow.correlation.values()))
+
+    def test_markets_that_move_together_are_called_one_bet(self):
+        a = synthetic_market("random", 600, 4)
+        b = [Candle(c.ts, c.open * 1.01, c.high * 1.01, c.low * 1.01, c.close * 1.01) for c in a]
+        fa = FlowAnalyst()
+        flow = fa.compare({}, {"A": a, "B": b})
+        self.assertGreater(flow.corr("A", "B"), 0.99)
+        self.assertTrue(any("one bet" in n for n in flow.notes))
+
+
+class StrategyLabTests(unittest.TestCase):
+    def test_searches_every_combination_and_is_honest_about_it(self):
+        candles = synthetic_market("random", 1200, 9)
+        lab = StrategyLab().build("X", candles, MarketObserver(), structure="random")
+        self.assertEqual(lab.tested, 21)
+        self.assertTrue(any("looks better than it really is" in n for n in lab.notes))
+        self.assertTrue(any("random walk" in n for n in lab.notes))
+        scores = [c.score for c in lab.candidates]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_never_picks_an_ineligible_candidate(self):
+        lab = StrategyLab().build("X", synthetic_market("mean_reverting", 1500, 5), MarketObserver())
+        if lab.chosen is not None:
+            self.assertTrue(lab.chosen.eligible)
+            self.assertGreater(lab.chosen.score, 0)
+
+    def test_short_history_finds_nothing(self):
+        lab = StrategyLab().build("X", synthetic_candles(60), MarketObserver())
+        self.assertIsNone(lab.chosen)
+        self.assertEqual(lab.tested, 0)
+
+
+class PortfolioTests(unittest.TestCase):
+    def plan(self, analyses, corr=None, limits=PortfolioLimits(), account=None):
+        return PortfolioRiskManager(limits).allocate(analyses, MarketFlow({}, corr or {}, (), ()),
+                                                     account or AccountState(equity=1000.0))
+
+    def test_nothing_approved_means_nothing_to_do(self):
+        self.assertEqual(self.plan([]).allocations, ())
+
+    def test_linked_markets_count_as_one_bet(self):
+        a = fake_analysis("A", Side.LONG, 10, 0.5)
+        b = fake_analysis("B", Side.LONG, 10, 0.9)
+        plan = self.plan([a, b], {("A", "B"): 0.9})
+        self.assertEqual([x.symbol for x in plan.allocations], ["B"])  # the stronger one is kept
+        self.assertIn("same bet", plan.skipped[0][1])
+
+    def test_opposite_sides_on_negatively_linked_markets_are_also_one_bet(self):
+        plan = self.plan([fake_analysis("A", Side.LONG, 10, 0.5), fake_analysis("B", Side.SHORT, 10, 0.4)],
+                         {("A", "B"): -0.9})
+        self.assertEqual(len(plan.allocations), 1)
+
+    def test_independent_markets_can_both_trade(self):
+        plan = self.plan([fake_analysis("A", Side.LONG, 10, 0.5), fake_analysis("B", Side.LONG, 10, 0.4)],
+                         {("A", "B"): 0.1})
+        self.assertEqual(len(plan.allocations), 2)
+        self.assertAlmostEqual(plan.total_risk, 0.02)
+
+    def test_total_risk_cap(self):
+        analyses = [fake_analysis(s, Side.LONG, 10, e) for s, e in (("A", 0.9), ("B", 0.8), ("C", 0.7))]
+        plan = self.plan(analyses, limits=PortfolioLimits(max_total_risk=0.02, max_positions=3))
+        self.assertEqual(len(plan.allocations), 2)
+        self.assertIn("cap", plan.skipped[0][1])
+
+    def test_position_limit_and_open_positions(self):
+        analyses = [fake_analysis("A", Side.LONG, 10, 0.9), fake_analysis("B", Side.LONG, 10, 0.8)]
+        self.assertEqual(len(self.plan(analyses, limits=PortfolioLimits(max_positions=1)).allocations), 1)
+        busy = AccountState(equity=1000.0, open_positions=1)
+        self.assertEqual(len(self.plan(analyses, limits=PortfolioLimits(max_positions=2), account=busy).allocations), 1)
+
+
+class ScanTests(unittest.TestCase):
+    def setUp(self):
+        self.markets = synthetic_markets(n=700)
+        self.result = scan_markets(self.markets, AccountState(equity=1000.0), QuorumConfig(), workers=1)
+
+    def test_one_analysis_per_market_in_order(self):
+        self.assertEqual([a.symbol for a in self.result.analyses], list(self.markets))
+
+    def test_bad_data_in_one_market_does_not_stop_the_others(self):
+        broken = dict(self.markets)
+        c = broken["TREND-A"]
+        broken["TREND-A"] = c[:100] + [Candle(c[100].ts, 100, 99, 101, 100)] + c[101:]
+        r = scan_markets(broken, AccountState(equity=1000.0), QuorumConfig(), workers=1)
+        a = {x.symbol: x for x in r.analyses}
+        self.assertTrue(a["TREND-A"].decision.reason.startswith("data check failed"))
+        self.assertIsNotNone(a["REVERT-B"].flow)
+
+    def test_report_names_every_market_and_the_warnings(self):
+        text = render_report(self.result, 1000.0)
+        for name in self.markets:
+            self.assertIn(name, text)
+        self.assertIn("Holdout exam", text)
+        self.assertIn("Read this before acting", text)
+
+    def test_exam_runs_even_without_a_live_setup(self):
+        team = build_coordinator(QuorumConfig(), TrendFollow(), with_state=False)
+        verdicts = team.exam("X", synthetic_candles())
+        self.assertEqual(len(verdicts), 2)  # validator and skeptic
+
+    def test_command_line_scan_writes_a_report(self):
+        folder = tempfile.mkdtemp()
+        paths = []
+        for name, candles in list(self.markets.items()):
+            path = os.path.join(folder, name + ".csv")
+            with open(path, "w") as f:
+                f.write("time,open,high,low,close\n")
+                for c in candles:
+                    f.write(f"{c.ts},{c.open},{c.high},{c.low},{c.close}\n")
+            paths.append(path)
+        out = os.path.join(folder, "report.md")
+        self.assertEqual(cli_main(["scan", *paths, "--workers", "1", "--out", out]), 0)
+        with open(out) as f:
+            self.assertIn("Quorum market scan", f.read())
 
 
 class SystemEvalTests(unittest.TestCase):

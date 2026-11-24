@@ -34,10 +34,10 @@ class Validator:
         self.min_positive_windows = min_positive_windows
         self.min_robust = min_robust
 
-    def review(self, proposal: Proposal, candles: list,
+    def review(self, proposal: Optional[Proposal], candles: list,
                signal_fn: Callable[[list], Optional[Proposal]],
                costs: CostModel = NO_COSTS, neighbors=()) -> Verdict:
-        if risk_of(proposal) <= 0:
+        if proposal is not None and risk_of(proposal) <= 0:
             return Verdict(self.name, Vote.REJECT, "stop is on the wrong side of entry")
         n = len(candles)
         start = max(self.warmup, int(n * (1 - self.holdout)))
@@ -69,7 +69,15 @@ class Validator:
             if robust / len(neighbors) < self.min_robust:
                 fails.append(f"fragile: only {robust} of {len(neighbors)} nearby settings profitable")
 
+        wins = sum(r for r in results if r > 0)
+        losses = -sum(r for r in results if r <= 0)
+        equity = peak = drawdown = 0.0
+        for r in results:
+            equity += r
+            peak = max(peak, equity)
+            drawdown = max(drawdown, peak - equity)
         metrics = {"trades": count, "expectancy_r": exp, "win_rate": win_rate,
+                   "profit_factor": wins / losses if losses > 0 else None, "max_drawdown_r": drawdown,
                    "windows_positive": positive, "windows_active": len(active),
                    "robust_positive": robust, "robust_total": len(neighbors)}
         if fails:
