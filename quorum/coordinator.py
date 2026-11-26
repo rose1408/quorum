@@ -39,7 +39,7 @@ class Coordinator:
 
     def _signal_fn(self, symbol: str, analyst):
         def signal_fn(history):
-            return analyst.propose(self.observer.observe(symbol, history, check_data=False))
+            return analyst.signal(symbol, history, self.observer)
         return signal_fn
 
     def decide(self, symbol: str, candles: list, account: AccountState, reference: Optional[list] = None) -> Decision:
@@ -58,7 +58,7 @@ class Coordinator:
         if not snapshot.data_ok:
             return self._done(Decision(None, False, (), 0.0, "data check failed: " + "; ".join(snapshot.notes), warnings))
 
-        proposal = self.analyst.propose(snapshot)
+        proposal = self.analyst.signal(symbol, candles, self.observer)
         if proposal is None:
             return self._done(Decision(None, False, (), 0.0, f"no setup right now ({snapshot.regime.value} market)", warnings))
 
@@ -109,7 +109,7 @@ class Coordinator:
         base = self.analyst.params
         analyst_type = type(self.analyst)
         return self.researcher.run(symbol, candles, self.observer,
-                                   lambda **params: analyst_type(**{**base, **params}), costs=self.costs)
+                                   lambda **params: analyst_type(**{**base, **params}).bind(self.analyst.context), costs=self.costs)
 
     def review_journal(self) -> list:
         if self.journal is None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from ..backtest import NO_COSTS, CostModel, expectancy, risk_of, simulate, simulate_trades
+from ..backtest import NO_COSTS, CostModel, drift_adjusted_r, expectancy, risk_of, simulate, simulate_detail
 from ..types import Proposal, Verdict, Vote
 
 
@@ -16,6 +16,8 @@ class Validator:
     - enough trades and positive expectancy after costs
     - walk-forward: the holdout is cut into windows, and enough of them must be profitable
     - robustness: nearby parameter settings must mostly be profitable too
+    - drift: a strategy that is mostly just long in a rising market must still
+      earn something after the market's own drift is subtracted
 
     The harness only ever shows the strategy candles up to the current bar.
     Keep the holdout data out of any tuning of the strategy.
@@ -41,7 +43,8 @@ class Validator:
             return Verdict(self.name, Vote.REJECT, "stop is on the wrong side of entry")
         n = len(candles)
         start = max(self.warmup, int(n * (1 - self.holdout)))
-        trades = simulate_trades(candles, signal_fn, start, None, costs)
+        detail = simulate_detail(candles, signal_fn, start, None, costs)
+        trades = [(t.entry, t.r) for t in detail]
         results = [r for _, r in trades]
         count = len(results)
         if count < self.min_trades:
@@ -53,6 +56,10 @@ class Validator:
         fails = []
         if exp <= self.min_expectancy_r:
             fails.append("not profitable: " + summary)
+
+        adjusted = expectancy(drift_adjusted_r(detail, candles, start))
+        if exp > self.min_expectancy_r and adjusted <= 0:
+            fails.append(f"the edge is just market drift: {exp:.2f}R raw but {adjusted:.2f}R once the market's own move is removed")
 
         span = max(1, n - start)
         buckets = [[] for _ in range(self.windows)]
@@ -76,7 +83,8 @@ class Validator:
             equity += r
             peak = max(peak, equity)
             drawdown = max(drawdown, peak - equity)
-        metrics = {"trades": count, "expectancy_r": exp, "win_rate": win_rate,
+        metrics = {"trades": count, "expectancy_r": exp, "drift_adjusted_expectancy_r": adjusted,
+                   "win_rate": win_rate,
                    "profit_factor": wins / losses if losses > 0 else None, "max_drawdown_r": drawdown,
                    "windows_positive": positive, "windows_active": len(active),
                    "robust_positive": robust, "robust_total": len(neighbors)}

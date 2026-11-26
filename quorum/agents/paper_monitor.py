@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from typing import Optional
 
 from ..types import Side
@@ -86,3 +87,20 @@ class PaperMonitor:
 
     def halted(self) -> bool:
         return self.report().halt
+
+    def save(self, path: str) -> None:
+        """Keep the settings and every recorded trade, so drift checks carry on between sessions."""
+        state = {"expected_r": self.expected_r, "tolerance_r": self.tolerance_r, "min_trades": self.min_trades,
+                 "max_slippage_r": self.max_slippage_r, "window": self.window,
+                 "trades": [{**asdict(t), "side": t.side.value} for t in self.trades]}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "PaperMonitor":
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+        trades = state.pop("trades")
+        monitor = cls(**state)
+        monitor.trades = [PaperTrade(**{**t, "side": Side(t["side"])}) for t in trades]
+        return monitor

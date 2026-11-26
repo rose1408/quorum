@@ -20,9 +20,25 @@ class MarketObserver:
         self.atr_period = atr_period
         self.channel_period = channel_period
         self.quality = quality or DataQualityAgent()
+        self._cache: dict = {}
 
     def observe(self, symbol: str, candles: list, check_data: bool = True) -> MarketSnapshot:
         """`check_data=False` skips the data checks. The Coordinator does that once up front."""
+        key = None
+        if not check_data and candles:
+            # a snapshot depends only on the history up to this candle, so strategies replaying the same data share it
+            key = (symbol, len(candles), candles[0].ts, candles[-1])
+            hit = self._cache.get(key)
+            if hit is not None:
+                return hit
+            if len(self._cache) > 300_000:
+                self._cache.clear()
+        snap = self._observe(symbol, candles, check_data)
+        if key is not None:
+            self._cache[key] = snap
+        return snap
+
+    def _observe(self, symbol: str, candles: list, check_data: bool) -> MarketSnapshot:
         problems = list(self.quality.check(candles).issues) if check_data else []
         last = candles[-1].close if candles else 0.0
         if len(candles) < self.slow + 1:

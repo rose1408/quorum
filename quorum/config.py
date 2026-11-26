@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from .agents import (MarketObserver, PaperMonitor, ResearchAnalyst, RiskLimits, RiskManager, Skeptic,
+from .agents import (DataQualityAgent, MarketObserver, PaperMonitor, ResearchAnalyst, RiskLimits, RiskManager, Skeptic,
                      TradeJournal, Validator)
 from .agents.portfolio_risk import PortfolioLimits
 from .agents.strategy_analyst import Strategy, TrendFollow
@@ -33,7 +33,8 @@ class QuorumConfig:
 
 
 def build_coordinator(config: Optional[QuorumConfig] = None, strategy: Optional[Strategy] = None,
-                      with_state: bool = True, max_luck: Optional[float] = None) -> Coordinator:
+                      with_state: bool = True, max_luck: Optional[float] = None,
+                      quality: Optional[DataQualityAgent] = None) -> Coordinator:
     """A full team for one market. `with_state` adds the Paper Monitor and Trade Journal."""
     config = config or QuorumConfig(costs=DEMO_COSTS)
     return Coordinator(
@@ -46,5 +47,6 @@ def build_coordinator(config: Optional[QuorumConfig] = None, strategy: Optional[
         monitor=PaperMonitor() if with_state else None,
         journal=TradeJournal() if with_state else None,
         researcher=ResearchAnalyst(holdout=config.holdout),
+        quality=quality,
         costs=config.costs,
     )

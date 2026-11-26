@@ -5,7 +5,8 @@ from typing import Optional
 
 from ..backtest import NO_COSTS, CostModel
 from .research_analyst import ExperimentResult, ResearchAnalyst
-from .strategy_analyst import FAMILIES
+from .families import FAMILIES, make_strategy
+from .strategy_analyst import Context
 
 DEFAULT_GRIDS = {
     "trend": {"stop_atr": [1.5, 2.0, 3.0], "reward_risk": [1.5, 2.0, 3.0]},
@@ -50,12 +51,21 @@ class StrategyLab:
         self.min_trades = min_trades
 
     def build(self, symbol: str, candles: list, observer, costs: CostModel = NO_COSTS,
-              structure: str = "unknown") -> LabReport:
-        candidates, tested = [], 0
+              structure: str = "unknown", context: Optional[Context] = None,
+              timeframe_s: Optional[int] = None) -> LabReport:
+        context = context or Context()
+        candidates, tested, skipped = [], 0, []
         for family, grid in self.grids.items():
-            cls = FAMILIES[family]
+            if family not in FAMILIES:
+                skipped.append(f"{family}: unknown strategy family")
+                continue
+            reason = make_strategy(family, {}, context).compatible(timeframe_s)
+            if reason:
+                skipped.append(f"{family} was skipped, it {reason}")
+                continue
             research = ResearchAnalyst(grid, self.holdout, self.warmup, self.train_frac, self.min_trades)
-            report = research.run(symbol, candles, observer, lambda cls=cls, **p: cls(**p), costs)
+            report = research.run(symbol, candles, observer,
+                                  lambda family=family, **p: make_strategy(family, p, context), costs)
             for r in report.results:
                 tested += 1
                 eligible = (r.train_trades >= self.min_trades and r.valid_trades >= self.min_trades
@@ -64,7 +74,7 @@ class StrategyLab:
         candidates.sort(key=lambda c: c.score, reverse=True)
         chosen = next((c for c in candidates if c.eligible), None)
 
-        notes = []
+        notes = list(skipped)
         if tested == 0:
             notes.append("not enough history to search for strategies")
         else:
@@ -72,6 +82,12 @@ class StrategyLab:
                          "better than it really is; the untouched holdout is the real test")
             eligible_count = sum(1 for c in candidates if c.eligible)
             notes.append(f"{eligible_count} of {tested} passed training and validation")
+            for family in {c.family for c in candidates}:
+                mine = [c for c in candidates if c.family == family]
+                if all(c.result.train_trades < self.min_trades or c.result.valid_trades < self.min_trades for c in mine):
+                    notes.append(f"{family}: too few trades to judge (at most {max(c.result.train_trades for c in mine)} "
+                                 f"on the training slice and {max(c.result.valid_trades for c in mine)} on validation, "
+                                 f"needs {self.min_trades} on each); a longer history is needed")
             if chosen is None:
                 notes.append("no combination held up, so there is nothing to trade here")
         if structure == "random":

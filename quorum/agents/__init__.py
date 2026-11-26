@@ -1,6 +1,9 @@
 from .data_quality import DataQualityAgent, DataReport
 from .market_observer import MarketObserver
-from .strategy_analyst import (FAMILIES, Breakout, MeanReversion, Strategy, StrategyAnalyst, TrendFollow)
+from .strategy_analyst import Breakout, Context, MeanReversion, Strategy, StrategyAnalyst, TrendFollow
+from .scheduled import AllDayLong, WeeklyDip
+from .news import NewsBreakout, NewsFade
+from .families import FAMILIES, make_strategy
 from .validator import Validator
 from .risk_manager import RiskManager, RiskLimits, AccountState
 from .skeptic import Skeptic
@@ -21,6 +24,12 @@ __all__ = [
     "Breakout",
     "MeanReversion",
     "FAMILIES",
+    "make_strategy",
+    "Context",
+    "WeeklyDip",
+    "AllDayLong",
+    "NewsBreakout",
+    "NewsFade",
     "Validator",
     "RiskManager",
     "RiskLimits",

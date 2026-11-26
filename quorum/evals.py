@@ -13,11 +13,12 @@ import sys
 from dataclasses import dataclass
 
 from .config import DEMO_COSTS, QuorumConfig, build_coordinator
-from .data import synthetic_candles, synthetic_markets
+from .data import synthetic_candles, synthetic_markets, synthetic_session_market
 from .scan import SymbolAnalysis, scan_markets
 from .agents import (AccountState, MarketFlow, MarketObserver, PaperMonitor, PaperTrade, PortfolioLimits,
                      PortfolioRiskManager, RiskLimits, RiskManager, StrategyAnalyst, Validator)
-from .backtest import NO_COSTS, simulate
+from .agents import DataQualityAgent
+from .backtest import NO_COSTS, simulate, walk
 from .coordinator import Coordinator
 from .types import Candle, Decision, Proposal, Side, Verdict, Vote
 
@@ -164,9 +165,39 @@ def eval_parallel_matches_sequential() -> EvalResult:
                       "identical" if one == many else "results differ")
 
 
+def eval_gap_through_stop_costs_more_than_one_r() -> EvalResult:
+    p = Proposal("E", Side.LONG, 100.0, 99.0, None, "test")
+    gap = [Candle(0, 100, 100, 100, 100), Candle(60, 95, 96, 94, 95)]
+    r, _ = walk(p, gap, 1)
+    short = Proposal("E", Side.SHORT, 100.0, 101.0, None, "test")
+    rs, _ = walk(short, [Candle(0, 100, 100, 100, 100), Candle(60, 105, 106, 104, 105)], 1)
+    ok = abs(r + 5.0) < 1e-9 and abs(rs + 5.0) < 1e-9
+    return EvalResult("a gap through the stop is booked at the gap price, not at the stop", ok, f"long {r:+.1f}R, short {rs:+.1f}R")
+
+
+def eval_riding_the_market_is_not_skill() -> EvalResult:
+    candles = [Candle(60 * i, 100 + 0.01 * i, 100.01 + 0.01 * i, 99.99 + 0.01 * i, 100.01 + 0.01 * i) for i in range(600)]
+    always_long = lambda h: Proposal("E", Side.LONG, h[-1].close, h[-1].close - 1.0, None, "always long",
+                                     h[-1].ts + 60 + 10 * 60, h[-1].ts + 60)
+    v = Validator(min_trades=5, min_expectancy_r=0.0, min_positive_windows=0.0, min_robust=0.0).review(
+        None, candles, always_long)
+    ok = v.vote == Vote.REJECT and "market drift" in v.reason
+    return EvalResult("being long in a rising market is not mistaken for an edge", ok, v.reason)
+
+
+def eval_normal_closures_do_not_block_session_markets() -> EvalResult:
+    candles = synthetic_session_market(years=0.15, seed=4)
+    session = DataQualityAgent(session_market=True).check(candles)
+    strict = DataQualityAgent().check(candles)
+    ok = session.ok and not strict.ok
+    return EvalResult("nightly and weekend closures block a 24/7 check but not a session market", ok,
+                      f"session market ok={session.ok}, 24/7 check ok={strict.ok}")
+
+
 ALL_EVALS = [eval_deterministic, eval_bad_data_blocks, eval_kill_switch_blocks, eval_veto_dominance,
              eval_size_within_risk, eval_costs_reduce_results, eval_reported_numbers_match, eval_monitor_halts,
-             eval_portfolio_caps, eval_parallel_matches_sequential]
+             eval_portfolio_caps, eval_parallel_matches_sequential, eval_gap_through_stop_costs_more_than_one_r,
+             eval_riding_the_market_is_not_skill, eval_normal_closures_do_not_block_session_markets]
 
 
 def run_evals() -> list:

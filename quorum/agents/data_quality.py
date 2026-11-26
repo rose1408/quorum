@@ -18,7 +18,12 @@ class DataQualityAgent:
     name = "data_quality"
 
     def __init__(self, gap_factor: float = 3.0, spike_k: float = 8.0, flat_run: int = 5,
-                 max_feed_diff: float = 0.001):
+                 max_feed_diff: float = 0.001, session_market: bool = False,
+                 closure_s: int = 3600, max_missing: float = 0.01):
+        # session markets (gold, indices) close every night and weekend, so long gaps are normal there
+        self.session_market = session_market
+        self.closure_s = closure_s
+        self.max_missing = max_missing
         self.gap_factor = gap_factor
         self.spike_k = spike_k
         self.flat_run = flat_run
@@ -50,8 +55,24 @@ class DataQualityAgent:
             typical = int(median(diffs))
             if typical > 0:
                 gaps = [i for i, d in enumerate(diffs) if d > self.gap_factor * typical]
-                if gaps:
-                    issues.append(self._flag(f"gaps over {self.gap_factor:g}x the typical interval", gaps))
+                small = [i for i, d in enumerate(diffs) if 1.5 * typical < d <= self.gap_factor * typical]
+                if self.session_market:
+                    closures = [i for i in gaps if diffs[i] > self.closure_s]
+                    if closures:
+                        warnings.append(f"{len(closures)} market closures (nights, weekends, holidays) of over "
+                                        f"{self.closure_s // 3600}h, treated as normal for this market")
+                    short = [i for i in range(len(diffs)) if 1.5 * typical < diffs[i] <= self.closure_s]
+                else:
+                    if gaps:
+                        issues.append(self._flag(f"gaps over {self.gap_factor:g}x the typical interval", gaps))
+                    short = small
+                if short:
+                    missing = sum(int(diffs[i] // typical) - 1 for i in short)
+                    text = self._flag("places with missing candles", short) + f", {missing} candles missing"
+                    if missing / len(candles) > self.max_missing:
+                        issues.append(text)
+                    else:
+                        warnings.append(text)
                 if any((c.ts - candles[0].ts) % typical for c in candles):
                     issues.append("timestamps are off the regular grid (timezone or feed shift?)")
 

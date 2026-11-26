@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from typing import Callable, Optional
 
-from ..backtest import NO_COSTS, CostModel, expectancy, simulate
+from ..backtest import NO_COSTS, CostModel, drift_adjusted_r, expectancy, simulate_detail
 from ..types import Proposal, Verdict, Vote
 
 
@@ -30,7 +30,9 @@ class Skeptic:
                signal_fn: Callable[[list], Optional[Proposal]],
                costs: CostModel = NO_COSTS, neighbors=()) -> Verdict:
         start = max(self.warmup, int(len(candles) * (1 - self.holdout)))
-        return self.assess(simulate(candles, signal_fn, start, None, costs))
+        detail = simulate_detail(candles, signal_fn, start, None, costs)
+        # judged after removing the market's own drift, so being long in a bull run is not mistaken for skill
+        return self.assess(drift_adjusted_r(detail, candles, start))
 
     def assess(self, results: list) -> Verdict:
         n = len(results)

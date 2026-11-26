@@ -57,7 +57,7 @@ class ResearchAnalyst:
             analyst = make_analyst(**params)
 
             def signal_fn(history, analyst=analyst):
-                return analyst.propose(observer.observe(symbol, history, check_data=False))
+                return analyst.signal(symbol, history, observer)
 
             train = simulate(region, signal_fn, self.warmup, split, costs)
             valid = simulate(region, signal_fn, split, len(region), costs)

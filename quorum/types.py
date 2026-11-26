@@ -54,8 +54,17 @@ class Proposal:
     side: Side
     entry: float
     stop: float
-    target: float
+    target: Optional[float]  # None means no take-profit; the trade ends at the stop or the time exit
     rationale: str
+    exit_ts: Optional[int] = None  # close the trade at the first candle that starts at or after this time
+    ts: Optional[int] = None       # when the idea was formed (end of the signal candle), for time-aware costs
+
+
+@dataclass(frozen=True)
+class NewsEvent:
+    ts: int            # release time, unix seconds
+    name: str = ""
+    impact: int = 3    # 1 low, 2 medium, 3 high
 
 
 @dataclass(frozen=True)

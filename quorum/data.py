@@ -8,7 +8,8 @@ import random
 import time
 from typing import Optional
 
-from .types import Candle
+from .clock import minute_of_day, weekday
+from .types import Candle, NewsEvent
 
 _ALIASES = {
     "time": ("time", "timestamp", "datetime", "date", "ts", "epoch"),
@@ -79,12 +80,13 @@ def load_markets(paths: list) -> dict:
     return {os.path.splitext(os.path.basename(p))[0]: load_candles(p) for p in paths}
 
 
-def _candles_from_closes(closes: list, rng: random.Random, start_price: float = 100.0, step: int = 60) -> list:
+def _candles_from_closes(closes: list, rng: random.Random, start_price: float = 100.0, step: int = 60,
+                         start_ts: int = 0) -> list:
     out, prev = [], start_price
     for i, c in enumerate(closes):
         h = max(prev, c) * (1 + abs(rng.gauss(0, 0.001)))
         l = min(prev, c) * (1 - abs(rng.gauss(0, 0.001)))
-        out.append(Candle(step * i, prev, h, l, c))
+        out.append(Candle(start_ts + step * i, prev, h, l, c))
         prev = c
     return out
 
@@ -104,7 +106,7 @@ def synthetic_candles(n: int = 600, seed: int = 7, drift: float = 0.0004) -> lis
 
 
 def synthetic_market(kind: str, n: int = 1500, seed: int = 1, shocks: Optional[list] = None,
-                     rho: float = 0.0) -> list:
+                     rho: float = 0.0, tf_s: int = 60, start_ts: int = 0) -> list:
     """Fake market with known behavior: 'trending', 'mean_reverting', or 'random'.
 
     `shocks` is a shared noise series; `rho` is how much of each step comes from it,
@@ -133,7 +135,7 @@ def synthetic_market(kind: str, n: int = 1500, seed: int = 1, shocks: Optional[l
             closes.append(math.exp(x))
     else:
         raise ValueError(f"unknown kind {kind!r}")
-    return _candles_from_closes(closes, rng)
+    return _candles_from_closes(closes, rng, step=tf_s, start_ts=start_ts)
 
 
 def synthetic_markets(n: int = 1500, seed: int = 7, rho: float = 0.4) -> dict:
@@ -145,3 +147,105 @@ def synthetic_markets(n: int = 1500, seed: int = 7, rho: float = 0.4) -> dict:
         "REVERT-B": synthetic_market("mean_reverting", n, seed + 2, shocks, rho),
         "RANDOM-C": synthetic_market("random", n, seed + 3, shocks, rho),
     }
+
+
+def load_news(path: str, min_impact: int = 1) -> tuple:
+    """Read a news calendar CSV: a time column, an optional event name, an optional impact.
+
+    Impact can be low/medium/high, 1/2/3, or a count of stars or bulls. Times are read as UTC.
+    """
+    levels = {"low": 1, "medium": 2, "med": 2, "high": 3}
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.reader(f, dialect)
+        header = [h.strip().strip("<>").lower() for h in next(reader)]
+        time_col = next((header.index(n) for n in _ALIASES["time"] if n in header), None)
+        if time_col is None:
+            raise ValueError(f"{os.path.basename(path)}: no time column")
+        name_col = next((header.index(n) for n in ("event", "name", "title", "description") if n in header), None)
+        impact_col = next((header.index(n) for n in ("impact", "importance", "volatility") if n in header), None)
+        out = []
+        for row in reader:
+            if not row or not row[time_col].strip():
+                continue
+            impact = 3
+            if impact_col is not None and row[impact_col].strip():
+                raw = row[impact_col].strip().lower()
+                impact = levels.get(raw) or (int(raw) if raw.isdigit() else raw.count("*") or raw.count("\u2605") or 3)
+            if impact >= min_impact:
+                out.append(NewsEvent(_parse_time(row[time_col]), row[name_col].strip() if name_col is not None else "", impact))
+    return tuple(sorted(out, key=lambda e: e.ts))
+
+
+def _session_open(ts: int) -> bool:
+    """US30-style hours in UTC: open Sunday 23:00 to Friday 22:00, with a daily break 22:00 to 23:00."""
+    dow, minute = weekday(ts, 0), minute_of_day(ts, 0)
+    if dow == 5 or (dow == 6 and minute < 23 * 60) or (dow == 4 and minute >= 22 * 60):
+        return False
+    return not (dow <= 3 and 22 * 60 <= minute < 23 * 60)
+
+
+def synthetic_session_market(years: float = 1.0, tf_s: int = 300, seed: int = 1, drift_per_year: float = 0.08,
+                             vol_per_year: float = 0.15, start_price: float = 40000.0, start_ts: int = 1704067200) -> list:
+    """Fake index with real-looking hours: nightly breaks, weekend closures, small gaps at reopening.
+
+    Starts Monday 2024-01-01 00:00 UTC. Drift is the steady upward pull, so long-only rules look good in it.
+    """
+    rng = random.Random(seed)
+    bars_per_year = 252 * (23 * 3600 / tf_s)
+    sigma, mu = vol_per_year / math.sqrt(bars_per_year), drift_per_year / bars_per_year
+    out, price, prev_open, ts = [], start_price, True, start_ts
+    end = start_ts + int(years * 365 * 86400)
+    while ts < end:
+        is_open = _session_open(ts)
+        if is_open:
+            gap = rng.gauss(0, 3 * sigma) if not prev_open else 0.0
+            o = price * (1 + gap)
+            c = o * math.exp(rng.gauss(mu, sigma))
+            out.append(Candle(ts, o, max(o, c) * (1 + abs(rng.gauss(0, sigma / 4))),
+                              min(o, c) * (1 - abs(rng.gauss(0, sigma / 4))), c))
+            price = c
+        prev_open = is_open
+        ts += tf_s
+    return out
+
+
+def synthetic_news_market(days: int = 20, tf_s: int = 60, seed: int = 1, follow_through: float = 0.0,
+                          start_price: float = 2000.0, start_ts: int = 1704067200) -> tuple:
+    """Fake gold-like market with scheduled news bursts. Returns (candles, news events).
+
+    Each weekday has a release at 13:30 UTC. For a few candles after it volatility jumps, and
+    `follow_through` (0 to 1) makes those moves keep going in the same direction. At 0 there is
+    nothing to trade; above 0 there is a real post-news pattern to find.
+    """
+    rng = random.Random(seed)
+    sigma = 0.0003
+    out, events, price, prev_open, ts = [], [], start_price, True, start_ts
+    end = start_ts + days * 86400
+    burst_left, last_r = 0, 0.0
+    while ts < end:
+        is_open = _session_open(ts)
+        if is_open:
+            minute, dow = minute_of_day(ts, 0), weekday(ts, 0)
+            if minute == 13 * 60 + 30 and dow < 5:
+                events.append(NewsEvent(ts, "US data", 3))
+                burst_left, last_r = 6, 0.0
+            if burst_left:
+                r = follow_through * last_r + rng.gauss(0, 5 * sigma) if burst_left < 6 else rng.gauss(0, 14 * sigma)
+                burst_left -= 1
+            else:
+                r = rng.gauss(0, sigma)
+            last_r = r
+            o = price * (1 + (rng.gauss(0, 2 * sigma) if not prev_open else 0.0))
+            c = o * math.exp(r)
+            out.append(Candle(ts, o, max(o, c) * (1 + abs(rng.gauss(0, sigma / 3))),
+                              min(o, c) * (1 - abs(rng.gauss(0, sigma / 3))), c))
+            price = c
+        prev_open = is_open
+        ts += tf_s
+    return out, tuple(events)

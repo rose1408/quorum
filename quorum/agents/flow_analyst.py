@@ -37,8 +37,11 @@ class MarketFlow:
 
 
 def _returns(candles: list, lookback: int) -> list:
-    closes = [c.close for c in candles[-(lookback + 1):]]
-    return [math.log(b / a) for a, b in zip(closes, closes[1:])]
+    """Log returns between consecutive candles, skipping jumps across closures (weekends, nights)."""
+    tail = candles[-(lookback + 1):]
+    diffs = sorted(b.ts - a.ts for a, b in zip(tail, tail[1:]))
+    typical = diffs[len(diffs) // 2] if diffs else 0
+    return [math.log(b.close / a.close) for a, b in zip(tail, tail[1:]) if b.ts - a.ts <= 3 * typical]
 
 
 def _autocorr(r: list, lag: int = 1) -> float:
@@ -153,7 +156,11 @@ class FlowAnalyst:
             if len(common) - 1 < self.min_overlap:
                 notes.append("too few overlapping candles to compare the markets")
             else:
-                rets = {s: [math.log(maps[s][b] / maps[s][a]) for a, b in zip(common, common[1:])] for s in maps}
+                steps = sorted(b - a for a, b in zip(common, common[1:]))
+                step = steps[len(steps) // 2]  # the usual spacing of times all markets share
+                pairs = [(a, b) for a, b in zip(common, common[1:]) if b - a == step]
+                common = [pairs[0][0]] + [b for _, b in pairs] if pairs else common
+                rets = {s: [math.log(maps[s][b] / maps[s][a]) for a, b in pairs] for s in maps}
                 names = list(rets)
                 for i, a in enumerate(names):
                     for b in names[i + 1:]:

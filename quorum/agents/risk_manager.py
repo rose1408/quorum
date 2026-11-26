@@ -53,11 +53,14 @@ class RiskManager:
         if account.open_positions >= L.max_open_positions:
             return no("max open positions reached")
         risk = p.entry - p.stop if p.side == Side.LONG else p.stop - p.entry
-        reward = p.target - p.entry if p.side == Side.LONG else p.entry - p.target
-        if risk <= 0 or reward <= 0:
-            return no("stop or target on the wrong side of entry")
-        if reward / risk < L.min_reward_risk:
-            return no(f"reward/risk {reward / risk:.2f} below {L.min_reward_risk}")
+        if risk <= 0:
+            return no("stop on the wrong side of entry")
+        if p.target is not None:  # trades that exit on a clock or a stop have no target to check
+            reward = p.target - p.entry if p.side == Side.LONG else p.entry - p.target
+            if reward <= 0:
+                return no("target on the wrong side of entry")
+            if reward / risk < L.min_reward_risk:
+                return no(f"reward/risk {reward / risk:.2f} below {L.min_reward_risk}")
         c = cost_r(p, costs)
         if c > L.max_cost_r:
             return no(f"costs take {c:.0%} of the risk, limit is {L.max_cost_r:.0%}")
