@@ -36,7 +36,7 @@ class Skeptic:
 
     def assess(self, results: list) -> Verdict:
         n = len(results)
-        if n < self.min_trades:
+        if n == 0 or n < self.min_trades:
             return Verdict(self.name, Vote.REJECT, f"only {n} trades, not enough evidence to judge")
         challenges = []
 

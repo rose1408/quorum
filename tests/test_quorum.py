@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import os
 import tempfile
@@ -1092,6 +1093,252 @@ class MonitorPersistenceTests(unittest.TestCase):
         self.assertEqual(back.trades, m.trades)
         self.assertEqual((back.expected_r, back.tolerance_r, back.min_trades, back.window), (0.4, 0.2, 3, 7))
         self.assertEqual(back.report(), m.report())
+
+
+def spike_candles(n=200):
+    return synthetic_candles(n)
+
+
+def put(candles, i, close, open_=None):
+    c = candles[i]
+    o = c.open if open_ is None else open_
+    candles[i] = Candle(c.ts, o, max(o, close), min(o, close), close)
+
+
+class DataQualityHardeningTests(unittest.TestCase):
+    def test_missing_or_infinite_prices_are_flagged(self):
+        for bad in (float("nan"), float("inf")):
+            c = spike_candles()
+            c[80] = Candle(c[80].ts, c[80].open, bad, c[80].low, c[80].close)
+            r = DataQualityAgent().check(c)
+            self.assertFalse(r.ok)
+            self.assertTrue(any("missing or infinite" in i for i in r.issues), r.issues)
+
+    def test_milliseconds_are_flagged_as_not_seconds(self):
+        c = [Candle(x.ts * 1000 + 1_700_000_000_000, x.open, x.high, x.low, x.close) for x in spike_candles()]
+        r = DataQualityAgent().check(c)
+        self.assertTrue(any("milliseconds" in i for i in r.issues))
+
+    def test_tiny_timestamps_only_warn(self):
+        r = DataQualityAgent().check(spike_candles())
+        self.assertTrue(r.ok)
+        self.assertTrue(any("before 1990" in w for w in r.warnings))
+
+    def test_a_full_reversal_is_a_bad_tick_but_a_partial_one_is_just_a_big_move(self):
+        c = spike_candles()
+        put(c, 100, c[100].close * 1.25)                      # one candle jumps, the next goes back to normal
+        self.assertTrue(any("bad ticks" in i for i in DataQualityAgent().check(c).issues))
+        d = spike_candles()
+        base = d[100].close
+        put(d, 100, base * 1.25)
+        put(d, 101, base * 1.10, open_=base * 1.25)           # gives back only part of it, like a news spike
+        r = DataQualityAgent().check(d)
+        self.assertTrue(r.ok, r.issues)
+        self.assertTrue(any("very large moves" in w for w in r.warnings))
+
+    def test_a_spike_that_reverses_near_a_release_is_excused(self):
+        c = spike_candles()
+        put(c, 100, c[100].close * 1.25)
+        near = DataQualityAgent(news_times=(c[100].ts,))
+        self.assertTrue(near.check(c).ok)
+        far = DataQualityAgent(news_times=(c[100].ts + 86400,))
+        self.assertFalse(far.check(c).ok)
+
+
+class ScheduleCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.p = PROFILES["us30"]
+        self.q = DataQualityAgent(session_market=True)
+        self.good = synthetic_session_market(years=0.3, seed=2)
+
+    def shifted(self, hours):
+        return [Candle(c.ts + hours * 3600, c.open, c.high, c.low, c.close) for c in self.good]
+
+    def test_a_correct_utc_file_raises_no_warning(self):
+        self.assertEqual(self.q.check_schedule(self.good, self.p.tz_offset_hours, self.p.expected_break_minutes), ())
+
+    def test_a_file_in_another_timezone_is_caught_with_the_fix(self):
+        for hours in (2, 3, -5, 8):
+            w = self.q.check_schedule(self.shifted(hours), self.p.tz_offset_hours, self.p.expected_break_minutes)
+            self.assertEqual(len(w), 1, hours)
+            self.assertIn(f"--data-utc-offset {hours:+d}", w[0])
+
+    def test_too_few_breaks_to_judge_means_no_opinion(self):
+        few = [c for c in self.good if c.ts < self.good[0].ts + 5 * 86400]
+        self.assertEqual(self.q.check_schedule(few, 8, (300, 360)), ())
+
+    def test_markets_with_no_expected_break_are_never_checked(self):
+        self.assertEqual(self.q.check_schedule(self.shifted(5), 8, ()), ())
+
+
+class InputHardeningTests(unittest.TestCase):
+    def test_a_market_whose_price_never_moves_is_unknown_not_a_crash(self):
+        flat = [Candle(1704063600 + 300 * i, 100, 100, 100, 100) for i in range(1500)]
+        r = FlowAnalyst().analyze("X", flat, MarketObserver())
+        self.assertEqual(r.structure, "unknown")
+        res = scan_markets({"X": flat}, AccountState(equity=1000.0), QuorumConfig(), workers=1)
+        self.assertFalse(res.analyses[0].decision.approved)
+
+    def test_tiny_and_empty_inputs_do_not_crash_a_scan_and_say_why(self):
+        for candles in ([], synthetic_candles(1), synthetic_candles(40)):
+            res = scan_markets({"X": candles}, AccountState(equity=1000.0), QuorumConfig(), workers=1,
+                               profiles={"X": PROFILES["us30"]})
+            self.assertFalse(res.analyses[0].decision.approved)
+            self.assertIn("far too few", res.analyses[0].decision.reason)
+
+    def test_a_frozen_price_is_blamed_on_the_data_not_the_strategies(self):
+        flat = [Candle(1704063600 + 300 * i, 100, 100, 100, 100) for i in range(1500)]
+        res = scan_markets({"X": flat}, AccountState(equity=1000.0), QuorumConfig(), workers=1)
+        self.assertIn("could not be read", res.analyses[0].decision.reason)
+
+    def test_a_skeptic_with_no_trades_and_no_minimum_rejects_instead_of_crashing(self):
+        v = Skeptic(min_trades=0).assess([])
+        self.assertEqual(v.vote, Vote.REJECT)
+
+    def test_lab_notes_follow_the_order_of_the_search_not_hash_luck(self):
+        candles, events = synthetic_news_market(days=10, follow_through=0.5, seed=3)
+        grids = {"news_fade": {"spike_atr": [1.5], "stop_atr": [1.5]}, "news_breakout": {"stop_atr": [1.0]}}
+        lab = StrategyLab(grids=grids, min_trades=50).build("X", candles, MarketObserver(),
+                                                             context=Context(news=events), timeframe_s=60)
+        thin = [n.split(":")[0] for n in lab.notes if "too few trades" in n]
+        self.assertEqual(thin, ["news_fade", "news_breakout"])
+
+    def test_trades_remember_their_entry_price(self):
+        c = synthetic_candles(120)
+        always = lambda h: Proposal("X", Side.LONG, h[-1].close, h[-1].close - 5, None, "t", h[-1].ts + 61 * 5, h[-1].ts + 60)
+        for t in simulate_detail(c, always, 10):
+            self.assertAlmostEqual(t.entry_price, c[t.entry].close)
+
+
+class LoaderHardeningTests(unittest.TestCase):
+    def write(self, text, name="X.csv"):
+        path = os.path.join(tempfile.mkdtemp(), name)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        return path
+
+    def test_decimal_commas_in_a_semicolon_file(self):
+        c = load_candles(self.write("time;open;high;low;close\n2024-01-02 10:00;100,5;101,0;100,0;100,8\n"))
+        self.assertEqual((c[0].open, c[0].high, c[0].low, c[0].close), (100.5, 101.0, 100.0, 100.8))
+
+    def test_a_missing_value_names_the_row_and_the_column(self):
+        with self.assertRaises(ValueError) as ctx:
+            load_candles(self.write("time,open,high,low,close\n2024-01-02 10:00,1,2,0.5,1.5\n2024-01-02 10:05,1,2,0.5,\n"))
+        self.assertIn("row 3", str(ctx.exception))
+        self.assertIn("close", str(ctx.exception))
+
+    def test_an_empty_file_says_so(self):
+        with self.assertRaises(ValueError) as ctx:
+            load_candles(self.write(""))
+        self.assertIn("empty", str(ctx.exception))
+
+    def test_dotted_european_dates_and_a_gmt_time_header(self):
+        c = load_candles(self.write("Gmt time,Open,High,Low,Close,Volume\n02.01.2024 10:00:00.000,100,101,99,100.5,10\n"))
+        self.assertEqual(c[0].ts, load_candles(self.write("time,open,high,low,close\n2024-01-02 10:00,100,101,99,100.5\n"))[0].ts)
+
+    def test_ambiguous_slash_dates_are_refused_with_a_hint(self):
+        with self.assertRaises(ValueError) as ctx:
+            load_candles(self.write("time,open,high,low,close\n02/01/2024 10:00,1,2,0.5,1.5\n"))
+        self.assertIn("ambiguous", str(ctx.exception))
+
+    def test_a_file_in_utc_plus_two_is_converted_to_utc(self):
+        path = self.write("time,open,high,low,close\n2024-01-02 10:00,1,2,0.5,1.5\n")
+        self.assertEqual(load_candles(path)[0].ts - load_candles(path, utc_offset_hours=2)[0].ts, 2 * 3600)
+        self.assertEqual(load_markets([path], 2)["X"][0].ts, load_candles(path, 2)[0].ts)
+
+    def test_a_news_calendar_in_philippine_time_is_converted(self):
+        path = self.write("time,event,impact\n2024-01-05 21:30,NFP,high\n")
+        self.assertEqual(load_news(path)[0].ts - load_news(path, utc_offset_hours=8)[0].ts, 8 * 3600)
+
+    def test_a_bad_news_time_names_the_row(self):
+        with self.assertRaises(ValueError) as ctx:
+            load_news(self.write("time,impact\nnot a time,high\n"))
+        self.assertIn("row 2", str(ctx.exception))
+
+
+class SizingTests(unittest.TestCase):
+    def setUp(self):
+        self.p = Proposal("X", Side.LONG, 100.0, 99.0, 102.0, "t")
+
+    def test_size_is_rounded_down_to_the_step_so_risk_is_never_exceeded(self):
+        v = RiskManager(RiskLimits(size_step=3.0)).review(self.p, AccountState(equity=1000.0))
+        self.assertAlmostEqual(v.size, 9.0)            # wanted 10, the step is 3
+
+    def test_a_trade_below_the_smallest_tradable_size_is_refused_and_explained(self):
+        v = RiskManager(RiskLimits(min_size=0.01, size_step=0.01)).review(
+            Proposal("US30", Side.LONG, 40000.0, 38000.0, None, "t"), AccountState(equity=1000.0))
+        self.assertEqual(v.vote, Vote.REJECT)
+        self.assertIn("smallest tradable size", v.reason)
+        ok = RiskManager(RiskLimits(min_size=0.01, size_step=0.01)).review(
+            Proposal("US30", Side.LONG, 40000.0, 38000.0, None, "t"), AccountState(equity=10000.0))
+        self.assertEqual(ok.vote, Vote.APPROVE)
+        self.assertAlmostEqual(ok.size, 0.05)
+
+    def test_no_limits_means_no_rounding(self):
+        v = RiskManager().review(self.p, AccountState(equity=1000.0))
+        self.assertAlmostEqual(v.size, 10.0)
+
+
+class ScanHardeningTests(unittest.TestCase):
+    def test_progress_messages_name_every_market(self):
+        seen = []
+        scan_markets(synthetic_markets(n=700), AccountState(equity=1000.0), QuorumConfig(), workers=1, progress=seen.append)
+        text = " ".join(seen)
+        for name in ("TREND-A", "REVERT-B", "RANDOM-C"):
+            self.assertIn(name + ": 700 candles", text)
+            self.assertIn(name + ": finished", text)
+
+    def test_if_processes_cannot_start_the_scan_still_finishes_with_the_same_answer(self):
+        markets = synthetic_markets(n=700)
+        one = scan_markets(markets, AccountState(equity=1000.0), QuorumConfig(), workers=1)
+        with mock.patch("quorum.scan.ProcessPoolExecutor", side_effect=OSError("no processes here")):
+            many = scan_markets(markets, AccountState(equity=1000.0), QuorumConfig(), workers=3)
+        self.assertEqual(one, many)
+
+    def test_a_wrong_timezone_is_put_first_in_the_report(self):
+        c = synthetic_session_market(years=0.3, seed=2)
+        shifted = [Candle(x.ts + 2 * 3600, x.open, x.high, x.low, x.close) for x in c]
+        res = scan_markets({"US30": shifted}, AccountState(equity=1000.0), QuorumConfig(), workers=1,
+                           profiles={"US30": PROFILES["us30"]})
+        text = render_report(res, 1000.0)
+        self.assertIn("Check this first", text)
+        self.assertIn("--data-utc-offset +2", text)
+        fine = scan_markets({"US30": c}, AccountState(equity=1000.0), QuorumConfig(), workers=1,
+                            profiles={"US30": PROFILES["us30"]})
+        self.assertNotIn("Check this first", render_report(fine, 1000.0))
+
+    def test_the_scorecard_reports_the_average_trade_as_a_percent_of_price(self):
+        from dataclasses import replace
+        prof = PROFILES["us30"]
+        cfg = replace(QuorumConfig(), costs=prof.costs, min_trades=prof.min_trades)
+        c = synthetic_session_market(years=0.5, seed=6, drift_per_year=0.1)
+        ctx = Context(prof.tz_offset_hours, prof.day_start_hour)
+        r = score_reference("US30", c, "all_day_long", {}, cfg, ctx, DataQualityAgent(session_market=True), 0.05)
+        strat = make_strategy("all_day_long", {}, ctx)
+        team = build_coordinator(cfg, strat, with_state=False)
+        detail = simulate_detail(c, team._signal_fn("US30", strat), 40, None, cfg.costs)
+        expected = sum(t.r * t.risk / t.entry_price for t in detail) / len(detail) * 100
+        self.assertAlmostEqual(r.avg_trade_pct, expected)
+        self.assertLess(abs(r.avg_trade_pct), 1.0)      # a daily trade moves well under 1% of the index
+
+
+class CommandLineTimezoneTests(unittest.TestCase):
+    def test_the_data_offset_option_fixes_a_broker_server_timezone(self):
+        folder = tempfile.mkdtemp()
+        good = synthetic_session_market(years=0.3, seed=2)
+        path = os.path.join(folder, "US30.csv")
+        with open(path, "w") as f:
+            f.write("time,open,high,low,close\n")
+            for c in good:
+                f.write(f"{c.ts + 2 * 3600},{c.open},{c.high},{c.low},{c.close}\n")   # a file in UTC+2
+        outs = {}
+        for label, extra in (("wrong", []), ("right", ["--data-utc-offset", "2"])):
+            out = os.path.join(folder, label + ".md")
+            self.assertEqual(cli_main(["scan", path + "=us30", "--workers", "1", "--out", out, *extra]), 0)
+            with open(out) as f:
+                outs[label] = f.read()
+        self.assertIn("Check this first", outs["wrong"])
+        self.assertNotIn("Check this first", outs["right"])
 
 
 class SystemEvalTests(unittest.TestCase):

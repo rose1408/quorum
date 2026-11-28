@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import csv
+import io
 import math
 import os
 import random
@@ -12,7 +13,7 @@ from .clock import minute_of_day, weekday
 from .types import Candle, NewsEvent
 
 _ALIASES = {
-    "time": ("time", "timestamp", "datetime", "date", "ts", "epoch"),
+    "time": ("time", "timestamp", "datetime", "date", "ts", "epoch", "gmt time", "local time", "time (utc)"),
     "open": ("open", "o"),
     "high": ("high", "h"),
     "low": ("low", "l"),
@@ -20,7 +21,8 @@ _ALIASES = {
 }
 _FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y.%m.%d %H:%M:%S", "%Y.%m.%d %H:%M",
             "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M",
-            "%Y-%m-%d", "%Y.%m.%d")
+            "%d.%m.%Y %H:%M:%S.%f", "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M",
+            "%Y-%m-%d", "%Y.%m.%d", "%d.%m.%Y")
 
 
 def _parse_time(text: str) -> int:
@@ -35,49 +37,75 @@ def _parse_time(text: str) -> int:
             return calendar.timegm(time.strptime(text, fmt))  # read as UTC
         except ValueError:
             continue
-    raise ValueError(f"cannot read time {text!r}")
+    hint = " (dates like 02/01/2024 are ambiguous, use 2024-01-02 or 02.01.2024)" if "/" in text else ""
+    raise ValueError(f"cannot read time {text!r}{hint}")
 
 
-def load_candles(path: str) -> list:
+def _read_table(path: str):
+    """Open a CSV and return (reader, lowercase header, file name, decimal-comma flag)."""
+    name = os.path.basename(path)
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        text = f.read()
+    if not text.strip():
+        raise ValueError(f"{name}: the file is empty")
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.reader(io.StringIO(text, newline=""), dialect)
+    header = [h.strip().strip("<>").lower() for h in next(reader)]
+    return reader, header, name, dialect.delimiter != ","
+
+
+def load_candles(path: str, utc_offset_hours: float = 0.0) -> list:
     """Read candles from a CSV (comma, tab, or semicolon separated). Handles MT5-style exports too.
 
     Needs columns for time, open, high, low, close. Date and time in separate
-    columns (like <DATE> and <TIME>) are joined. Rows are kept in file order, so
+    columns (like <DATE> and <TIME>) are joined. Prices may use a decimal comma
+    when the file is semicolon or tab separated. `utc_offset_hours` is the
+    timezone of the file's times (2 means the file is in UTC+2, as many broker
+    servers are); times are converted to UTC. Rows are kept in file order, so
     the Data Quality Agent can flag anything out of order.
     """
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        sample = f.read(4096)
-        f.seek(0)
+    reader, header, name, decimal_comma = _read_table(path)
+    index = {}
+    for key, names in _ALIASES.items():
+        for alias in names:
+            if alias in header and key not in index:
+                index[key] = header.index(alias)
+    missing = [k for k in _ALIASES if k not in index]
+    if missing:
+        raise ValueError(f"{name}: missing column(s) {', '.join(missing)}; found {', '.join(header)}")
+    split_date_time = "date" in header and "time" in header and header.index("date") != header.index("time")
+    shift = int(utc_offset_hours * 3600)
+
+    def number(row, key):
+        cell = row[index[key]]
+        raw = cell.strip().replace(",", ".") if decimal_comma else cell.strip()
         try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-        except csv.Error:
-            dialect = csv.excel
-        reader = csv.reader(f, dialect)
-        header = [h.strip().strip("<>").lower() for h in next(reader)]
-        index = {}
-        for key, names in _ALIASES.items():
-            for name in names:
-                if name in header and key not in index:
-                    index[key] = header.index(name)
-        missing = [k for k in _ALIASES if k not in index]
-        if missing:
-            raise ValueError(f"{os.path.basename(path)}: missing column(s) {', '.join(missing)}")
-        time_col = index["time"]
-        out = []
-        for row in reader:
-            if not row or all(not x.strip() for x in row):
-                continue
-            stamp = row[time_col]
-            if "date" in header and "time" in header and header.index("date") != header.index("time"):
-                stamp = row[header.index("date")] + " " + row[header.index("time")]
-            out.append(Candle(_parse_time(stamp), float(row[index["open"]]), float(row[index["high"]]),
-                              float(row[index["low"]]), float(row[index["close"]])))
-        return out
+            return float(raw)
+        except ValueError:
+            raise ValueError(f"{name}: row {reader.line_num}: cannot read the {key} value {cell!r}") from None
+
+    out = []
+    for row in reader:
+        if not row or all(not x.strip() for x in row):
+            continue
+        try:
+            stamp = (row[header.index("date")] + " " + row[header.index("time")]) if split_date_time else row[index["time"]]
+            ts = _parse_time(stamp) - shift
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"{name}: row {reader.line_num}: {e}") from None
+        try:
+            out.append(Candle(ts, number(row, "open"), number(row, "high"), number(row, "low"), number(row, "close")))
+        except IndexError:
+            raise ValueError(f"{name}: row {reader.line_num}: the row has fewer columns than the header") from None
+    return out
 
 
-def load_markets(paths: list) -> dict:
+def load_markets(paths: list, utc_offset_hours: float = 0.0) -> dict:
     """Map market name (the file name without extension) to its candles."""
-    return {os.path.splitext(os.path.basename(p))[0]: load_candles(p) for p in paths}
+    return {os.path.splitext(os.path.basename(p))[0]: load_candles(p, utc_offset_hours) for p in paths}
 
 
 def _candles_from_closes(closes: list, rng: random.Random, start_price: float = 100.0, step: int = 60,
@@ -149,36 +177,34 @@ def synthetic_markets(n: int = 1500, seed: int = 7, rho: float = 0.4) -> dict:
     }
 
 
-def load_news(path: str, min_impact: int = 1) -> tuple:
+def load_news(path: str, min_impact: int = 1, utc_offset_hours: float = 0.0) -> tuple:
     """Read a news calendar CSV: a time column, an optional event name, an optional impact.
 
-    Impact can be low/medium/high, 1/2/3, or a count of stars or bulls. Times are read as UTC.
+    Impact can be low/medium/high, 1/2/3, or a count of stars. Times are read as UTC unless
+    `utc_offset_hours` says the calendar uses another timezone (for example 8 for Philippine time).
     """
     levels = {"low": 1, "medium": 2, "med": 2, "high": 3}
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        sample = f.read(4096)
-        f.seek(0)
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-        except csv.Error:
-            dialect = csv.excel
-        reader = csv.reader(f, dialect)
-        header = [h.strip().strip("<>").lower() for h in next(reader)]
-        time_col = next((header.index(n) for n in _ALIASES["time"] if n in header), None)
-        if time_col is None:
-            raise ValueError(f"{os.path.basename(path)}: no time column")
-        name_col = next((header.index(n) for n in ("event", "name", "title", "description") if n in header), None)
-        impact_col = next((header.index(n) for n in ("impact", "importance", "volatility") if n in header), None)
-        out = []
-        for row in reader:
-            if not row or not row[time_col].strip():
-                continue
-            impact = 3
-            if impact_col is not None and row[impact_col].strip():
-                raw = row[impact_col].strip().lower()
-                impact = levels.get(raw) or (int(raw) if raw.isdigit() else raw.count("*") or raw.count("\u2605") or 3)
-            if impact >= min_impact:
-                out.append(NewsEvent(_parse_time(row[time_col]), row[name_col].strip() if name_col is not None else "", impact))
+    reader, header, name, _ = _read_table(path)
+    time_col = next((header.index(n) for n in _ALIASES["time"] if n in header), None)
+    if time_col is None:
+        raise ValueError(f"{name}: no time column")
+    name_col = next((header.index(n) for n in ("event", "name", "title", "description") if n in header), None)
+    impact_col = next((header.index(n) for n in ("impact", "importance", "volatility") if n in header), None)
+    shift = int(utc_offset_hours * 3600)
+    out = []
+    for row in reader:
+        if not row or not row[time_col].strip():
+            continue
+        impact = 3
+        if impact_col is not None and row[impact_col].strip():
+            raw = row[impact_col].strip().lower()
+            impact = levels.get(raw) or (int(raw) if raw.isdigit() else raw.count("*") or raw.count("\u2605") or 3)
+        if impact >= min_impact:
+            try:
+                ts = _parse_time(row[time_col]) - shift
+            except ValueError as e:
+                raise ValueError(f"{name}: row {reader.line_num}: {e}") from None
+            out.append(NewsEvent(ts, row[name_col].strip() if name_col is not None else "", impact))
     return tuple(sorted(out, key=lambda e: e.ts))
 
 

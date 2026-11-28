@@ -6,7 +6,7 @@ import sys
 from .agents import AccountState, RiskLimits
 from .backtest import CostModel
 from .config import DEMO_COSTS, QuorumConfig
-from .data import (load_markets, load_news, synthetic_market, synthetic_markets, synthetic_news_market,
+from .data import (load_markets, load_news, synthetic_market, synthetic_news_market,
                    synthetic_session_market)
 from .profiles import PROFILES
 from .report import render_report
@@ -32,6 +32,10 @@ def main(argv=None) -> int:
     scan.add_argument("files", nargs="+",
                       help="one CSV per market, optionally FILE=PROFILE where PROFILE is " + ", ".join(PROFILES))
     scan.add_argument("--news", help="news calendar CSV (time, event, impact), used by the xau profile")
+    scan.add_argument("--data-utc-offset", type=float, default=0.0,
+                      help="timezone of the times in your candle files in hours from UTC (2 means UTC+2, common for broker servers)")
+    scan.add_argument("--news-utc-offset", type=float, default=0.0,
+                      help="timezone of the times in the news calendar in hours from UTC")
     for p in (scan, demo):
         p.add_argument("--equity", type=float, default=1000.0)
         p.add_argument("--workers", type=int, default=3, help="markets analyzed at the same time")
@@ -52,12 +56,15 @@ def main(argv=None) -> int:
                 parser.error(f"unknown profile {prof!r}; choose from {', '.join(PROFILES)}")
             paths.append(path)
             chosen[path] = prof
-        markets = load_markets(paths)
+        markets = load_markets(paths, args.data_utc_offset)
+        for name, c in markets.items():
+            if len(c) < 500:
+                print(f"warning: {name} has only {len(c)} candles, too few for a trustworthy result", file=sys.stderr)
         for path, name in zip(paths, markets):
             if chosen[path]:
                 profiles[name] = PROFILES[chosen[path]]
         if args.news:
-            news = load_news(args.news)
+            news = load_news(args.news, utc_offset_hours=args.news_utc_offset)
         config = QuorumConfig(costs=CostModel(args.spread, args.slippage, args.fee),
                               risk=RiskLimits(risk_per_trade=args.risk))
     else:
@@ -65,7 +72,8 @@ def main(argv=None) -> int:
         config = QuorumConfig(costs=DEMO_COSTS)
 
     result = scan_markets(markets, AccountState(equity=args.equity), config, workers=args.workers,
-                          profiles=profiles, news=news)
+                          profiles=profiles, news=news,
+                          progress=lambda message: print(message, file=sys.stderr, flush=True))
     text = render_report(result, args.equity)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:

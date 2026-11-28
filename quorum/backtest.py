@@ -78,6 +78,7 @@ class Trade:
     r: float     # net result in R multiples, after costs
     risk: float  # price distance from entry to stop
     side: Side
+    entry_price: float = 0.0
 
 
 def risk_of(p: Proposal) -> float:
@@ -141,7 +142,7 @@ def simulate_detail(candles: list, signal_fn: Callable[[list], Optional[Proposal
         if out is None:
             break
         r, j = out
-        trades.append(Trade(i, j, r, risk_of(p), p.side))
+        trades.append(Trade(i, j, r, risk_of(p), p.side, p.entry))
         i = j + 1
     return trades
 

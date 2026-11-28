@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
-
-from ..types import Side
 
 
 @dataclass(frozen=True)

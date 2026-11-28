@@ -82,7 +82,7 @@ class StrategyLab:
                          "better than it really is; the untouched holdout is the real test")
             eligible_count = sum(1 for c in candidates if c.eligible)
             notes.append(f"{eligible_count} of {tested} passed training and validation")
-            for family in {c.family for c in candidates}:
+            for family in [f for f in self.grids if any(c.family == f for c in candidates)]:
                 mine = [c for c in candidates if c.family == family]
                 if all(c.result.train_trades < self.min_trades or c.result.valid_trades < self.min_trades for c in mine):
                     notes.append(f"{family}: too few trades to judge (at most {max(c.result.train_trades for c in mine)} "

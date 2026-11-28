@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import math
+from bisect import bisect_left
 from dataclasses import dataclass
 from statistics import median
 from typing import Optional
+
+from ..clock import minute_of_day
 
 
 @dataclass(frozen=True)
@@ -19,7 +23,11 @@ class DataQualityAgent:
 
     def __init__(self, gap_factor: float = 3.0, spike_k: float = 8.0, flat_run: int = 5,
                  max_feed_diff: float = 0.001, session_market: bool = False,
-                 closure_s: int = 3600, max_missing: float = 0.01):
+                 closure_s: int = 3600, max_missing: float = 0.01, news_times: tuple = (),
+                 news_window_s: int = 600):
+        # spikes that reverse near a news release are normal there, not bad ticks
+        self.news_times = tuple(sorted(news_times))
+        self.news_window_s = news_window_s
         # session markets (gold, indices) close every night and weekend, so long gaps are normal there
         self.session_market = session_market
         self.closure_s = closure_s
@@ -29,20 +37,35 @@ class DataQualityAgent:
         self.flat_run = flat_run
         self.max_feed_diff = max_feed_diff
 
+    def _near_news(self, ts: int) -> bool:
+        if not self.news_times:
+            return False
+        i = bisect_left(self.news_times, ts - self.news_window_s)
+        return i < len(self.news_times) and self.news_times[i] <= ts + self.news_window_s
+
     @staticmethod
     def _flag(label: str, idx: list) -> str:
         return f"{len(idx)} {label} (first at index {idx[0]})"
 
     def check(self, candles: list, reference: Optional[list] = None) -> DataReport:
         issues, warnings = [], []
-        nonpos, ohlc, order = [], [], []
+        nonfinite, nonpos, ohlc, order = [], [], [], []
         for i, c in enumerate(candles):
+            if not all(math.isfinite(x) for x in (c.open, c.high, c.low, c.close)):
+                nonfinite.append(i)
+                continue
             if min(c.open, c.high, c.low, c.close) <= 0:
                 nonpos.append(i)
             if c.high < c.low or c.high < max(c.open, c.close) or c.low > min(c.open, c.close):
                 ohlc.append(i)
             if i > 0 and c.ts <= candles[i - 1].ts:
                 order.append(i)
+        if candles and max(candles[0].ts, candles[-1].ts) > 4102444800:
+            issues.append("timestamps are far in the future, so they are probably milliseconds and not unix seconds")
+        elif candles and min(candles[0].ts, candles[-1].ts) < 631152000:
+            warnings.append("timestamps start before 1990, check that the time column is unix seconds or a real date")
+        if nonfinite:
+            issues.append(self._flag("candles with missing or infinite prices", nonfinite))
         if nonpos:
             issues.append(self._flag("candles with non-positive prices", nonpos))
         if ohlc:
@@ -76,9 +99,9 @@ class DataQualityAgent:
                 if any((c.ts - candles[0].ts) % typical for c in candles):
                     issues.append("timestamps are off the regular grid (timezone or feed shift?)")
 
-        if len(candles) > 5 and not nonpos:
+        if len(candles) > 5 and not nonpos and not nonfinite:
             closes = [c.close for c in candles]
-            rets = [b / a - 1 for a, b in zip(closes, closes[1:])]
+            rets = [math.log(b / a) for a, b in zip(closes, closes[1:])]
             med = median(rets)
             mad = median(abs(r - med) for r in rets)
             if mad > 0:
@@ -87,10 +110,12 @@ class DataQualityAgent:
                 for i, r in enumerate(rets):
                     if abs(r - med) > self.spike_k * sigma:
                         nxt = rets[i + 1] if i + 1 < len(rets) else 0.0
-                        reverses = nxt * r < 0 and abs(nxt) >= 0.5 * abs(r)
-                        (bad if reverses else big).append(i + 1)
+                        # a bad tick is a V: the next move takes back nearly all of it. News spikes rarely do.
+                        v_shape = nxt * r < 0 and abs(nxt + r) <= 0.25 * abs(r)
+                        excused = self._near_news(candles[i + 1].ts)
+                        (bad if v_shape and not excused else big).append(i + 1)
                 if bad:
-                    issues.append(self._flag("possible bad ticks (spike that reverses)", bad))
+                    issues.append(self._flag("possible bad ticks (a spike that fully reverses)", bad))
                 if big:
                     warnings.append(self._flag("very large moves", big))
 
@@ -114,3 +139,41 @@ class DataQualityAgent:
                     issues.append(f"feeds disagree: worst close difference {worst:.2%}")
 
         return DataReport(not issues, tuple(issues), tuple(warnings))
+
+    def check_schedule(self, candles: list, offset_hours: float, expected_minutes: tuple,
+                       tolerance: int = 30, min_breaks: int = 10) -> tuple:
+        """Warnings if the daily trading break is not where this market's break should be on the rule clock.
+
+        If a file's times are in broker server time instead of UTC, every clock rule (and a news
+        calendar given in UTC) would silently be hours off. The daily break is a fingerprint of the
+        timezone. Returns a tuple of warnings, empty when things look right or there is too little to judge.
+        """
+        if len(candles) < 3 or not expected_minutes:
+            return ()
+        diffs = [b.ts - a.ts for a, b in zip(candles, candles[1:])]
+        typical = int(median(diffs))
+        if typical <= 0:
+            return ()
+        starts = [minute_of_day(a.ts + typical, offset_hours) for a, b in zip(candles, candles[1:])
+                  if 3600 < b.ts - a.ts <= 8 * 3600]
+        if len(starts) < min_breaks:
+            return ()
+
+        def near(m: int) -> int:
+            return min(min(abs(m - e), 1440 - abs(m - e)) for e in expected_minutes)
+
+        fits = sum(1 for m in starts if near(m) <= tolerance)
+        if fits / len(starts) >= 0.8:
+            return ()
+        common = max(set(m // 15 * 15 for m in starts), key=lambda m: sum(1 for x in starts if x // 15 * 15 == m))
+        shifts = [((common - e + 720) % 1440 - 720) for e in expected_minutes]
+        primary = shifts[0]
+        others = sorted(set(shifts[1:]) - {primary})
+        fmt = lambda m: f"{m // 60:02d}:{m % 60:02d}"
+        extra = (f" (or {', '.join(f'{o / 60:+.0f}' for o in others)} if the break you see is the other season's)"
+                 if others else "")
+        return (f"the daily break starts around {fmt(common)} on the rule clock, but this market's break should be near "
+                + " or ".join(fmt(e) for e in expected_minutes)
+                + f"; the file's times look shifted by about {primary / 60:+.0f} hours (broker server time instead of UTC?). "
+                  f"If so, scan again with --data-utc-offset {primary / 60:+.0f}{extra}. "
+                "Clock rules and the news calendar would be misaligned, so check the timestamps before trusting any result",)

@@ -1,8 +1,11 @@
 """Per-market settings: timeframe, clock, costs, and which strategies to search.
 
-THE COST NUMBERS BELOW ARE PLACEHOLDER GUESSES. Replace them with what your
-broker actually charges (spread, slippage, and for index CFDs the overnight
-swap). Results are only as honest as these numbers.
+THE COST NUMBERS AND SIZE LIMITS BELOW ARE PLACEHOLDER GUESSES. Replace them with
+what your broker actually charges and allows (spread, slippage, the overnight
+swap for index CFDs, the smallest tradable size). Results are only as honest as
+these numbers. The expected daily break (05:00 or 06:00 Philippine time, which
+is the US 5pm close in summer or winter) is also a guess used to catch files
+whose timestamps are in the wrong timezone.
 """
 from __future__ import annotations
 
@@ -29,6 +32,9 @@ class MarketProfile:
     min_trades: int = 20             # holdout trades the Validator and Skeptic need
     lab_min_trades: int = 10         # trades each search slice needs
     references: tuple = ()           # (family, params) rules to score exactly as given, next to whatever the search finds
+    expected_break_minutes: tuple = ()  # where the daily break should start on the rule clock (first is the main one), used to catch a wrong timezone
+    min_size: Optional[float] = None    # smallest tradable size, in units of the instrument
+    size_step: Optional[float] = None
 
 
 _SCALP = {
@@ -55,13 +61,15 @@ PROFILES = {
         costs=CostModel(spread=0.30, slippage=0.05),
         cost_note="spread, slippage, and the news multiplier are placeholders; measure them on your broker, "
                   "gold spreads can widen many times over at big releases",
-        news_multiplier=5.0, news_window_s=600, grids=_SCALP, min_trades=30, lab_min_trades=15),
+        news_multiplier=5.0, news_window_s=600, grids=_SCALP, min_trades=30, lab_min_trades=15,
+        expected_break_minutes=(360, 300), min_size=1.0, size_step=1.0),
     "us30": MarketProfile(
         "us30", "US30, 5-minute candles, includes your Monday-dip and all-day-long rules", 300,
         costs=CostModel(spread=3.0, slippage=1.0, overnight_pct=0.0001),
         cost_note="spread, slippage, and the overnight financing (0.01% per day) are placeholders; "
                   "check your broker's swap for long US30 positions",
         grids=_US30, lab_min_trades=8,
-        references=(("weekly_dip", {}), ("all_day_long", {}))),
+        references=(("weekly_dip", {}), ("all_day_long", {})),
+        expected_break_minutes=(360, 300), min_size=0.01, size_step=0.01),
     "generic": MarketProfile("generic", "no market profile, generic search", 300, session_market=False),
 }

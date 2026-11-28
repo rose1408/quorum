@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from statistics import mean
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -117,6 +116,9 @@ class FlowAnalyst:
         if not snap.data_ok or len(r) < 60:
             return FlowReport(symbol, "unknown", 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, "neutral",
                               snap.vol_state, 0.5, ("not enough clean history to read the flow",))
+        if snap.atr <= 0 or not any(r):
+            return FlowReport(symbol, "unknown", 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, "neutral",
+                              snap.vol_state, 0.5, ("price has not moved, so there is no flow to read (frozen feed?)",))
         n = len(r)
         ac = _autocorr(r)
         ac_z = ac * math.sqrt(n)

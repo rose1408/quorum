@@ -61,16 +61,16 @@ class DailyIndex:
         self._day = None
         self._last_close = None
         self._n = 0
-        self._first_ts = None
-        self._last_ts = None
+        self._first = None
+        self._last = None
 
     def _day_of(self, ts: int) -> int:
         return (ts + int((self.offset - self.day_start) * 3600)) // 86400
 
     def update(self, history) -> None:
         n = len(history)
-        if self._n and (n < self._n or history[0].ts != self._first_ts or history[self._n - 1].ts != self._last_ts):
-            self.reset()
+        if self._n and (n < self._n or history[0] != self._first or history[self._n - 1] != self._last):
+            self.reset()  # a different history than the one this was built from, so start over
         for k in range(self._n, n):
             c = history[k]
             d = self._day_of(c.ts)
@@ -81,8 +81,8 @@ class DailyIndex:
                 self._day = d
             self._last_close = c.close
         if n:
-            self._first_ts = history[0].ts
-            self._last_ts = history[n - 1].ts
+            self._first = history[0]
+            self._last = history[n - 1]
         self._n = n
 
     def sma(self, days: int) -> Optional[float]:

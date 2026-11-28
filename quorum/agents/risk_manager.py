@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -27,6 +28,8 @@ class RiskLimits:
     min_reward_risk: float = 1.5
     max_cost_r: float = 0.25       # costs may not eat more than this share of the risk
     max_notional_multiple: Optional[float] = None  # cap on size * entry vs equity, off by default
+    min_size: Optional[float] = None   # smallest tradable size on the broker, in units of the instrument
+    size_step: Optional[float] = None  # sizes come in multiples of this; rounded down so risk is never exceeded
 
 
 class RiskManager:
@@ -70,4 +73,9 @@ class RiskManager:
             cap = account.equity * L.max_notional_multiple / p.entry
             if size > cap:
                 size, note = cap, note + ", size capped by exposure limit"
+        if L.size_step:
+            size = math.floor(size / L.size_step + 1e-9) * L.size_step
+        if L.min_size is not None and size < L.min_size:
+            return no(f"the right size for this stop is below the smallest tradable size of {L.min_size:g}; "
+                      "the account is too small for this stop distance at this risk per trade")
         return Verdict(self.name, Vote.APPROVE, note, size)

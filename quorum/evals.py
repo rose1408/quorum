@@ -13,12 +13,14 @@ import sys
 from dataclasses import dataclass
 
 from .config import DEMO_COSTS, QuorumConfig, build_coordinator
-from .data import synthetic_candles, synthetic_markets, synthetic_session_market
+from .data import (synthetic_candles, synthetic_market, synthetic_markets, synthetic_news_market,
+                   synthetic_session_market)
 from .scan import SymbolAnalysis, scan_markets
 from .agents import (AccountState, MarketFlow, MarketObserver, PaperMonitor, PaperTrade, PortfolioLimits,
                      PortfolioRiskManager, RiskLimits, RiskManager, StrategyAnalyst, Validator)
-from .agents import DataQualityAgent
-from .backtest import NO_COSTS, simulate, walk
+from .agents import (AllDayLong, Breakout, Context, DataQualityAgent, MeanReversion, NewsBreakout, NewsFade,
+                     StrategyLab, TrendFollow, WeeklyDip)
+from .backtest import NO_COSTS, Prefix, simulate, walk
 from .coordinator import Coordinator
 from .types import Candle, Decision, Proposal, Side, Verdict, Vote
 
@@ -194,10 +196,72 @@ def eval_normal_closures_do_not_block_session_markets() -> EvalResult:
                       f"session market ok={session.ok}, 24/7 check ok={strict.ok}")
 
 
+def _garbage_future(series: list, k: int, seed: int) -> list:
+    """The same candles up to index k, then made-up prices with the same timestamps."""
+    rng, x, out = random.Random(seed), rng_start(seed), list(series[:k])
+    for c in series[k:]:
+        o = x
+        x = max(1e-3, x * (1 + rng.gauss(0, 0.05)))
+        out.append(Candle(c.ts, o, max(o, x) * 1.01, min(o, x) * 0.99, x))
+    return out
+
+
+def rng_start(seed: int) -> float:
+    return 10.0 + (seed * 7919) % 50_000
+
+
+def eval_no_future_leak() -> EvalResult:
+    """Every strategy must give the same answer at a moment whether or not the future is known.
+
+    This catches a strategy whose answer depends on candles it is handed beyond the current one. It cannot
+    catch one that secretly keeps its own full copy of the data, so a strategy must compute only from the
+    history it is given.
+    """
+    jobs = []
+    trend = synthetic_market("trending", 700, 4)
+    for make in (TrendFollow, Breakout, lambda: MeanReversion(entry_stretch=1.5)):
+        jobs.append(("generic", make, trend, Context(), 500))
+    session = synthetic_session_market(years=0.15, seed=6)
+    for make in (WeeklyDip, AllDayLong, lambda: WeeklyDip(ma_days=5)):
+        jobs.append(("clock", make, session, Context(), int(len(session) * 0.75)))
+    news_candles, events = synthetic_news_market(days=8, follow_through=0.5, seed=4)
+    for make in (NewsBreakout, NewsFade):
+        jobs.append(("news", make, news_candles, Context(news=events), int(len(news_candles) * 0.75)))
+    compared, bad = 0, []
+    for kind, make, series, ctx, k in jobs:
+        future = _garbage_future(series, k, seed=k)
+        real, fake = make().bind(ctx), make().bind(ctx)
+        o1, o2 = MarketObserver(), MarketObserver()
+        step = 1 if kind == "generic" else 3
+        for i in range(60, k - 1, step):
+            a = real.signal("E", Prefix(series, i + 1), o1)
+            b = fake.signal("E", Prefix(future, i + 1), o2)
+            compared += a is not None
+            if a != b:
+                bad.append(f"{type(real).__name__} at candle {i}")
+                break
+    return EvalResult("no strategy changes its mind when the future is replaced", not bad and compared > 0,
+                      f"compared {compared} live signals across {len(jobs)} strategies" if not bad else "; ".join(bad))
+
+
+def eval_search_never_sees_the_holdout() -> EvalResult:
+    """Wrecking the recent 40% of the data must not change anything the strategy search decides."""
+    candles = synthetic_market("mean_reverting", 1500, 5)
+    cut = int(len(candles) * 0.6)
+    wrecked = _garbage_future(candles, cut, seed=9)
+    a = StrategyLab().build("E", candles, MarketObserver(), DEMO_COSTS)
+    b = StrategyLab().build("E", wrecked, MarketObserver(), DEMO_COSTS)
+    team = build_coordinator(QuorumConfig(costs=DEMO_COSTS), TrendFollow(), with_state=False)
+    sensitive = team.exam("E", candles) != team.exam("E", wrecked)   # the holdout exam does notice the change
+    return EvalResult("the strategy search never sees the holdout, the exam always does", a == b and sensitive,
+                      f"search identical={a == b}, exam changed={sensitive}")
+
+
 ALL_EVALS = [eval_deterministic, eval_bad_data_blocks, eval_kill_switch_blocks, eval_veto_dominance,
              eval_size_within_risk, eval_costs_reduce_results, eval_reported_numbers_match, eval_monitor_halts,
              eval_portfolio_caps, eval_parallel_matches_sequential, eval_gap_through_stop_costs_more_than_one_r,
-             eval_riding_the_market_is_not_skill, eval_normal_closures_do_not_block_session_markets]
+             eval_riding_the_market_is_not_skill, eval_normal_closures_do_not_block_session_markets,
+             eval_no_future_leak, eval_search_never_sees_the_holdout]
 
 
 def run_evals() -> list:

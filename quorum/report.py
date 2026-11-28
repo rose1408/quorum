@@ -37,6 +37,10 @@ def render_report(scan: ScanResult, equity: float) -> str:
 
     for a in scan.analyses:
         out += [f"## {a.symbol}", ""]
+        for w in a.schedule_warnings:
+            out.append(f"- **Check this first:** {w}")
+        for w in a.warnings:
+            out.append(f"- Data note: {w}")
         if a.profile and a.profile != "generic":
             out.append(f"- Profile: {a.profile}")
             if a.cost_note:
@@ -49,12 +53,15 @@ def render_report(scan: ScanResult, equity: float) -> str:
                        f"volatility {f.vol_state}, sitting at {f.range_position:.0%} of its 50-bar range")
             for note in f.notes:
                 out.append(f"- {note}")
+            if a.search_structure and a.search_structure != f.structure:
+                out.append(f"- On the older data the search was allowed to see, the structure reads {a.search_structure}")
         if a.references:
             out += ["", "Your rules as given, tested on this history:", "",
-                    "| Rule | Trades | Win rate | Avg R | Avg R without market drift | Profit factor | Worst drawdown | "
-                    "Return at risk per trade | Just holding | Holdout exam |", "|---|---|---|---|---|---|---|---|---|---|"]
+                    "| Rule | Trades | Win rate | Avg R | Avg trade | Avg R without market drift | Profit factor | "
+                    "Worst drawdown | Return at risk per trade | Just holding | Holdout exam |",
+                    "|---|---|---|---|---|---|---|---|---|---|---|"]
             for r in a.references:
-                out.append(f"| {r.family} | {r.trades} | {r.win_rate:.0%} | {r.expectancy_r:+.3f} | {r.drift_adjusted_r:+.3f} | "
+                out.append(f"| {r.family} | {r.trades} | {r.win_rate:.0%} | {r.expectancy_r:+.3f} | {r.avg_trade_pct:+.3f}% | {r.drift_adjusted_r:+.3f} | "
                            f"{_pct(r.profit_factor)} | {r.max_drawdown_r:.1f}R | {r.equity_return_pct:+.1f}% | "
                            f"{r.buy_hold_pct:+.1f}% | {'PASSED' if r.passed else 'failed'} |")
             for r in a.references:
@@ -103,8 +110,6 @@ def render_report(scan: ScanResult, equity: float) -> str:
             out.append(f"- Idea: {p.side.value} at {p.entry:.4f}, stop {p.stop:.4f}, {tgt}{ext} ({p.rationale})")
         for v in d.verdicts:
             out.append(f"  - {v.agent}: {v.vote.value}, {v.reason}")
-        for w in d.warnings:
-            out.append(f"- Data warning: {w}")
         out.append("")
 
     out += ["## Portfolio plan", ""]
